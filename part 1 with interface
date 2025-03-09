@@ -1,0 +1,806 @@
+import bql
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import re
+from datetime import datetime
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import adfuller
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+# --- Variables globales de contrôle ---
+stop_flag = False
+
+# --- Widgets pour l'interface ---
+pair_widget = widgets.Text(value="EURUSD", description="Pair:")
+tenors_widget = widgets.SelectMultiple(
+    options=["1M", "2M", "3M", "6M", "9M", "1Y","2Y"],
+    value=("1M", "2M", "3M", "6M", "9M", "1Y","2Y"),
+    description="Tenors:"
+)
+start_date_widget = widgets.DatePicker(value=datetime(2024, 1, 18), description="Start Date:")
+end_date_widget = widgets.DatePicker(value=datetime.today(), description="End Date:")
+rolling_window_widget = widgets.IntSlider(value=100, min=50, max=300, step=10, description="Rolling window:")
+realized_windows_widget = widgets.Text(value="5,10,30,90", description="Realized windows:")
+spot_return_threshold_widget = widgets.FloatSlider(value=0.002, min=0.001, max=0.01, step=0.0005, description="Spot thresh:")
+
+progress_bar = widgets.IntProgress(value=0, min=0, max=100, description="Progress:")
+
+# Boutons
+run_button = widgets.Button(description="Run Script", button_style='success')
+stop_button = widgets.Button(description="Stop", button_style='danger')
+stop_button.disabled = True
+
+# Checkboxes pour activer/désactiver chacun des graphiques/indicateurs
+check_spot           = widgets.Checkbox(value=True,  description="Spot")
+check_atm            = widgets.Checkbox(value=True,  description="ATM")
+check_25d_rr         = widgets.Checkbox(value=True,  description="25D RR")
+check_25d_bf         = widgets.Checkbox(value=True,  description="25D BF")
+check_10d_rr         = widgets.Checkbox(value=True,  description="10D RR")
+check_10d_bf         = widgets.Checkbox(value=True,  description="10D BF")
+check_realized_vol   = widgets.Checkbox(value=True,  description="Realized Vol")
+check_correlation    = widgets.Checkbox(value=True,  description="Corr (Spot/ATM)")
+check_vol_of_vol     = widgets.Checkbox(value=True,  description="Vol of Vol")
+check_zscore         = widgets.Checkbox(value=True,  description="Z-Score(ATM)")
+check_mean_zscore    = widgets.Checkbox(value=True,  description="Mean Z-Score(ATM)")
+check_beta           = widgets.Checkbox(value=True,  description="Beta(Vol vs Spot)")
+check_beta_up_down   = widgets.Checkbox(value=True,  description="Beta Spot Up/Down")
+check_calendar       = widgets.Checkbox(value=True,  description="Calendar Z-Score")
+check_stationarity   = widgets.Checkbox(value=True,  description="Stationarity Z")
+
+ui = widgets.VBox([
+    pair_widget, tenors_widget, start_date_widget, end_date_widget,
+    rolling_window_widget, realized_windows_widget, spot_return_threshold_widget,
+    widgets.HBox([run_button, stop_button]),
+    widgets.HBox([
+        widgets.VBox([
+            check_spot,
+            check_atm,
+            check_25d_rr,
+            check_25d_bf,
+            check_10d_rr,
+            check_10d_bf,
+            check_realized_vol,
+            check_correlation
+        ]),
+        widgets.VBox([
+            check_vol_of_vol,
+            check_zscore,
+            check_mean_zscore,
+            check_beta,
+            check_beta_up_down,
+            check_calendar,
+            check_stationarity
+        ])
+    ]),
+    progress_bar
+])
+output_area = widgets.Output()
+
+display(ui)
+display(output_area)
+
+########################################
+# Configuration graphique Plotly
+########################################
+layout_conf = dict(
+    template="plotly_dark",
+    autosize=False,
+    width=900,
+    height=500,
+    plot_bgcolor="rgba(55,55,55,1)",
+    paper_bgcolor="rgba(55,55,55,1)",
+    margin=dict(l=60, r=80, t=80, b=60),
+    dragmode='pan',
+    xaxis=dict(gridcolor="rgba(255,255,255,0.3)", gridwidth=0.5, tickfont=dict(size=14)),
+    yaxis=dict(gridcolor="rgba(255,255,255,0.3)", gridwidth=0.5, tickfont=dict(size=14)),
+    legend=dict(
+        orientation='v', x=1.02, y=0.5, xanchor='left', yanchor='middle',
+        bgcolor='rgba(15,15,15,0.6)', bordercolor='rgba(200,200,200,0.4)', borderwidth=1,
+        font=dict(color='white', size=12), itemsizing='constant', tracegroupgap=10
+    ),
+    showlegend=True
+)
+plotly_config = dict(scrollZoom=True)
+
+########################################
+# Variables globales
+########################################
+stop_flag = False
+current_pair = None
+df_raw = pd.DataFrame()
+
+########################################
+# Fonctions utilitaires
+########################################
+
+def connect_gaps_traces(fig):
+    fig.update_traces(connectgaps=True)
+
+def update_fig_title(fig, title_text):
+    fig.update_layout(
+        title=dict(text=title_text, x=0.5, xanchor='center', font=dict(size=18, color="white", family="Arial Black")),
+        showlegend=True
+    )
+    fig.update_layout(**layout_conf)
+
+def detect_category(ticker: str):
+    t_up = ticker.upper().replace(" BGN CURNCY", "").strip()
+    if t_up == current_pair.upper():
+        return "Spot"
+    if "V" in t_up:
+        return "ATM_vol"
+    if "25R" in t_up:
+        return "25D_RR"
+    if "25B" in t_up:
+        return "25D_BF"
+    if "10R" in t_up:
+        return "10D_RR"
+    if "10B" in t_up:
+        return "10D_BF"
+    return "Forward"
+
+def extract_tenor(ticker: str):
+    match = re.search(r"(\d+[WMY])", ticker.upper())
+    return match.group(1) if match else np.nan
+
+def safe_log_ratio(series, eps=1e-8):
+    ratio = series / series.shift(1)
+    ratio = ratio.clip(lower=eps)
+    return np.log(ratio)
+
+def compute_AR1_half_life(series: pd.Series) -> float:
+    s = series.dropna()
+    if len(s) < 5:
+        return np.nan
+    from math import log
+    import statsmodels.api as sm
+    Y = s[1:].values
+    X = s[:-1].values
+    X = sm.add_constant(X)
+    if len(Y) != len(X):
+        return np.nan
+    model = sm.OLS(Y, X, missing='drop')
+    res = model.fit()
+    if len(res.params) < 2:
+        return np.nan
+    phi = res.params[1]
+    if abs(phi) >= 1:
+        return np.nan
+    hl = -np.log(2) / np.log(abs(phi))
+    return hl
+
+def parse_tenor_str(tn: str) -> float:
+    if not isinstance(tn, str):
+        return 9999
+    t = tn.upper().replace(" ", "")
+    if "W" in t:
+        val = float(t[:-1])
+        return val/52.0
+    elif "M" in t:
+        val = float(t[:-1])
+        return val/12.0
+    elif "Y" in t:
+        val = float(t[:-1])
+        return val*1.0
+    return 9999
+
+def build_category_orders_for_tenor(df, col_name="Tenor"):
+    unique_tenors = df[col_name].dropna().unique()
+    sorted_tenors = sorted(unique_tenors, key=parse_tenor_str)
+    return {col_name: sorted_tenors}
+
+########################################
+# Fonctions de tracé
+########################################
+
+def plot_spot():
+    spot_df = df_raw[df_raw["Category"]=="Spot"].copy()
+    if spot_df.empty:
+        return
+    spot_df.sort_values("DATE", inplace=True)
+    last_spot = spot_df["Value"].iloc[-1]
+    fig = px.line(spot_df, x="DATE", y="Value")
+    fig.update_traces(name=f"Spot {last_spot:.4f}", line=dict(color='white', width=2.0))
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{current_pair} Spot")
+    fig.update_layout(showlegend=True)
+    with output_area:
+        display(fig)
+
+def plot_atm():
+    atm_df = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    if atm_df.empty:
+        return
+    atm_df.sort_values(["Tenor","DATE"], inplace=True)
+    cat_orders = build_category_orders_for_tenor(atm_df, "Tenor")
+    fig = px.line(atm_df, x="DATE", y="Value", color="Tenor", category_orders=cat_orders)
+    for trace in fig.data:
+        tenor = trace.name
+        sub = atm_df[atm_df["Tenor"]==tenor]
+        if not sub.empty:
+            val = sub["Value"].iloc[-1]
+            if pd.notna(val):
+                trace.name = f"{tenor} {val:.2f}"
+    fig.update_traces(line=dict(width=1.5))
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{current_pair} ATM Vol")
+    fig.update_layout(showlegend=True)
+    with output_area:
+        display(fig)
+
+def plot_25d_rr():
+    rr_df = df_raw[df_raw["Category"]=="25D_RR"].copy()
+    if rr_df.empty:
+        return
+    rr_df.sort_values(["Tenor","DATE"], inplace=True)
+    cat_orders = build_category_orders_for_tenor(rr_df, "Tenor")
+    fig = px.line(rr_df, x="DATE", y="Value", color="Tenor", category_orders=cat_orders)
+    for trace in fig.data:
+        tenor = trace.name
+        sub = rr_df[rr_df["Tenor"]==tenor]
+        if not sub.empty:
+            val = sub["Value"].iloc[-1]
+            if pd.notna(val):
+                trace.name = f"{tenor} {val:.2f}"
+    fig.add_hline(y=0, line_color='red', line_width=2)
+    fig.update_traces(line=dict(width=1.5))
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{current_pair} 25D RR")
+    fig.update_layout(showlegend=True)
+    with output_area:
+        display(fig)
+
+def plot_25d_bf():
+    bf_df = df_raw[df_raw["Category"]=="25D_BF"].copy()
+    if bf_df.empty:
+        return
+    bf_df.sort_values(["Tenor","DATE"], inplace=True)
+    cat_orders = build_category_orders_for_tenor(bf_df, "Tenor")
+    fig = px.line(bf_df, x="DATE", y="Value", color="Tenor", category_orders=cat_orders)
+    for trace in fig.data:
+        tenor = trace.name
+        sub = bf_df[bf_df["Tenor"]==tenor]
+        if not sub.empty:
+            val = sub["Value"].iloc[-1]
+            if pd.notna(val):
+                trace.name = f"{tenor} {val:.2f}"
+    fig.update_traces(line=dict(width=1.5))
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{current_pair} 25D BF")
+    fig.update_layout(showlegend=True)
+    with output_area:
+        display(fig)
+
+def plot_10d_rr():
+    rr10_df = df_raw[df_raw["Category"]=="10D_RR"].copy()
+    if rr10_df.empty:
+        return
+    rr10_df.sort_values(["Tenor","DATE"], inplace=True)
+    cat_orders = build_category_orders_for_tenor(rr10_df, "Tenor")
+    fig = px.line(rr10_df, x="DATE", y="Value", color="Tenor", category_orders=cat_orders)
+    for trace in fig.data:
+        tenor = trace.name
+        sub = rr10_df[rr10_df["Tenor"]==tenor]
+        if not sub.empty:
+            val = sub["Value"].iloc[-1]
+            if pd.notna(val):
+                trace.name = f"{tenor} {val:.2f}"
+    fig.add_hline(y=0, line_color='red', line_width=2)
+    fig.update_traces(line=dict(width=1.5))
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{current_pair} 10D RR")
+    fig.update_layout(showlegend=True)
+    with output_area:
+        display(fig)
+
+def plot_10d_bf():
+    bf10_df = df_raw[df_raw["Category"]=="10D_BF"].copy()
+    if bf10_df.empty:
+        return
+    bf10_df.sort_values(["Tenor","DATE"], inplace=True)
+    cat_orders = build_category_orders_for_tenor(bf10_df, "Tenor")
+    fig = px.line(bf10_df, x="DATE", y="Value", color="Tenor", category_orders=cat_orders)
+    for trace in fig.data:
+        tenor = trace.name
+        sub = bf10_df[bf10_df["Tenor"]==tenor]
+        if not sub.empty:
+            val = sub["Value"].iloc[-1]
+            if pd.notna(val):
+                trace.name = f"{tenor} {val:.2f}"
+    fig.update_traces(line=dict(width=1.5))
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{current_pair} 10D BF")
+    fig.update_layout(showlegend=True)
+    with output_area:
+        display(fig)
+
+def plot_realized_vol():
+    spot = df_raw[df_raw["Category"]=="Spot"].copy()
+    if spot.empty:
+        return
+    spot.sort_values("DATE", inplace=True)
+    spot["Return"] = safe_log_ratio(spot["Value"])
+    realized_windows = [int(x.strip()) for x in realized_windows_widget.value.split(",")]
+    rv_df = pd.DataFrame(index=spot["DATE"])
+    rv_df["Return"] = spot["Return"].values
+    for w in realized_windows:
+        rv_df[f"RV_{w}d"] = rv_df["Return"].rolling(w, min_periods=w).std() * np.sqrt(260)
+    rv_df.reset_index(inplace=True)
+    df_melt = rv_df.melt(id_vars="DATE", var_name="Window", value_name="RealizedVol")
+    df_melt = df_melt[df_melt["Window"]!="Return"]
+    df_melt.sort_values(["Window","DATE"], inplace=True)
+    fig = px.line(df_melt, x="DATE", y="RealizedVol", color="Window")
+    for trace in fig.data:
+        col_name = trace.name
+        sub = df_melt[df_melt["Window"]==col_name]
+        if not sub.empty:
+            val = sub["RealizedVol"].iloc[-1]
+            if pd.notna(val):
+                trace.name = f"{col_name} {val:.2%}"
+    fig.update_traces(line=dict(width=1.5))
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{current_pair} Realized Vol")
+    fig.update_layout(yaxis_tickformat=".2%")
+    fig.update_layout(showlegend=True)
+    with output_area:
+        display(fig)
+
+def plot_correlation():
+    window = rolling_window_widget.value
+    spot_df = df_raw[df_raw["Category"]=="Spot"].copy()
+    atm_df  = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    if spot_df.empty or atm_df.empty:
+        return
+    spot_df.sort_values("DATE", inplace=True)
+    spot_df["Ret"] = safe_log_ratio(spot_df["Value"])
+    corr_data = []
+    for tn in atm_df["Tenor"].unique():
+        sub = atm_df[atm_df["Tenor"]==tn].copy().sort_values("DATE")
+        sub["RetVol"] = safe_log_ratio(sub["Value"])
+        merged = pd.merge(spot_df[["DATE","Ret"]], sub[["DATE","RetVol"]], on="DATE", how="inner")
+        merged["Corr"] = merged["Ret"].rolling(window).corr(merged["RetVol"])
+        for d_ in merged["DATE"]:
+            c_ = merged.loc[merged["DATE"]==d_, "Corr"].values[0]
+            corr_data.append((d_, tn, c_))
+    df_corr = pd.DataFrame(corr_data, columns=["DATE","Tenor","Correlation"])
+    df_corr.sort_values(["Tenor","DATE"], inplace=True)
+    cat_orders = build_category_orders_for_tenor(df_corr, "Tenor")
+    fig = px.line(df_corr, x="DATE", y="Correlation", color="Tenor", category_orders=cat_orders)
+    for trace in fig.data:
+        tenor = trace.name
+        sub = df_corr[df_corr["Tenor"]==tenor]
+        if not sub.empty:
+            val = sub["Correlation"].iloc[-1]
+            if pd.notna(val):
+                trace.name = f"{tenor} {val:.2%}"
+    fig.add_hline(y=0, line_color='red', line_width=1)
+    fig.update_traces(line=dict(width=1.5))
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{current_pair} Corr(Spot vs ATM), w={window}")
+    fig.update_layout(yaxis_tickformat=".2%")
+    fig.update_layout(showlegend=True)
+    with output_area:
+        display(fig)
+
+def plot_vol_of_vol():
+    window = rolling_window_widget.value
+    atm_df = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    if atm_df.empty:
+        return
+    atm_df.sort_values(["Tenor","DATE"], inplace=True)
+    data_list = []
+    for tn in atm_df["Tenor"].unique():
+        sub = atm_df[atm_df["Tenor"]==tn].copy()
+        sub["VolReturn"] = safe_log_ratio(sub["Value"])
+        sub["VolOfVol"] = sub["VolReturn"].rolling(window).std() * np.sqrt(260)
+        for d_, v_ in zip(sub["DATE"], sub["VolOfVol"]):
+            data_list.append((d_, tn, v_))
+    df_vov = pd.DataFrame(data_list, columns=["DATE","Tenor","VolOfVol"])
+    df_vov.sort_values(["Tenor","DATE"], inplace=True)
+    cat_orders = build_category_orders_for_tenor(df_vov, "Tenor")
+    fig = px.line(df_vov, x="DATE", y="VolOfVol", color="Tenor", category_orders=cat_orders)
+    for trace in fig.data:
+        tenor = trace.name
+        sub = df_vov[df_vov["Tenor"]==tenor]
+        if not sub.empty:
+            val = sub["VolOfVol"].iloc[-1]
+            if pd.notna(val):
+                trace.name = f"{tenor} {val:.2%}"
+    fig.update_traces(line=dict(width=1.5))
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{current_pair} ATM VolOfVol(window={window})")
+    fig.update_layout(yaxis_tickformat=".2%")
+    fig.update_layout(showlegend=True)
+    with output_area:
+        display(fig)
+
+def plot_zscore():
+    window = rolling_window_widget.value
+    atm_df = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    if atm_df.empty:
+        return
+    atm_df.sort_values(["Tenor","DATE"], inplace=True)
+    data_list = []
+    for tn in atm_df["Tenor"].unique():
+        sub = atm_df[atm_df["Tenor"]==tn].copy()
+        roll_mean = sub["Value"].rolling(window).mean()
+        roll_std  = sub["Value"].rolling(window).std()
+        z_ = (sub["Value"] - roll_mean)/roll_std
+        for d_, zval in zip(sub["DATE"], z_):
+            data_list.append((d_, tn, zval))
+    df_z = pd.DataFrame(data_list, columns=["DATE","Tenor","ZScore"])
+    df_z.sort_values(["Tenor","DATE"], inplace=True)
+    cat_orders = build_category_orders_for_tenor(df_z, "Tenor")
+    fig = px.line(df_z, x="DATE", y="ZScore", color="Tenor", category_orders=cat_orders)
+    for trace in fig.data:
+        tenor = trace.name
+        sub   = df_z[df_z["Tenor"]==tenor]
+        if not sub.empty:
+            val = sub["ZScore"].iloc[-1]
+            if pd.notna(val):
+                trace.name = f"{tenor} {val:.2f}"
+    fig.add_hline(y=0, line_color='red', line_width=1)
+    fig.update_traces(line=dict(width=1.5))
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{current_pair} ATM ZScore(window={window})")
+    fig.update_layout(showlegend=True)
+    with output_area:
+        display(fig)
+
+def plot_mean_zscore():
+    window = rolling_window_widget.value
+    atm_df = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    if atm_df.empty:
+        return
+    pivot_atm = atm_df.pivot(index="DATE", columns="Tenor", values="Value").sort_index()
+    z_pivot = (pivot_atm - pivot_atm.rolling(window).mean()) / pivot_atm.rolling(window).std()
+    z_pivot["MeanZScore"] = z_pivot.mean(axis=1, skipna=True)
+    z_pivot.reset_index(inplace=True)
+    z_pivot.sort_values("DATE", inplace=True)
+    fig = px.line(z_pivot, x="DATE", y="MeanZScore")
+    last_val = z_pivot["MeanZScore"].iloc[-1]
+    if pd.notna(last_val):
+        fig.update_traces(name=f"MeanZScore {last_val:.2f}", line=dict(width=2.0))
+    else:
+        fig.update_traces(name="MeanZScore", line=dict(width=2.0))
+    connect_gaps_traces(fig)
+    fig.add_hline(y=0, line_color='red', line_width=1)
+    update_fig_title(fig, f"{current_pair} MeanZScore(window={window})")
+    fig.update_layout(showlegend=True)
+    with output_area:
+        display(fig)
+
+def plot_beta():
+    window = rolling_window_widget.value
+    spot = df_raw[df_raw["Category"]=="Spot"].copy()
+    atm  = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    if spot.empty or atm.empty:
+        return
+    spot.sort_values("DATE", inplace=True)
+    spot["Ret_spot"] = safe_log_ratio(spot["Value"])
+    data_list = []
+    for tn in atm["Tenor"].unique():
+        sub = atm[atm["Tenor"]==tn].copy()
+        sub.sort_values("DATE", inplace=True)
+        sub["Ret_atm"] = safe_log_ratio(sub["Value"])
+        merged = pd.merge(spot[["DATE","Ret_spot"]], sub[["DATE","Ret_atm"]], on="DATE", how="inner")
+        cov_ = merged["Ret_atm"].rolling(window).cov(merged["Ret_spot"])
+        var_ = merged["Ret_spot"].rolling(window).var()
+        beta_ = (cov_/var_)/10.0
+        for d_, b_ in zip(merged["DATE"], beta_):
+            data_list.append((d_, tn, b_))
+    df_beta = pd.DataFrame(data_list, columns=["DATE","Tenor","Beta"])
+    df_beta.sort_values(["Tenor","DATE"], inplace=True)
+    cat_orders = build_category_orders_for_tenor(df_beta, "Tenor")
+    fig = px.line(df_beta, x="DATE", y="Beta", color="Tenor", category_orders=cat_orders)
+    for trace in fig.data:
+        tenor = trace.name
+        sub = df_beta[df_beta["Tenor"]==tenor]
+        if not sub.empty:
+            val = sub["Beta"].iloc[-1]
+            if pd.notna(val):
+                trace.name = f"{tenor} {val:.3f}"
+    fig.update_traces(line=dict(width=1.5))
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{current_pair} Beta(Vol vs Spot, w={window})")
+    fig.add_hline(y=0, line_color='red', line_width=1)
+    fig.update_layout(showlegend=True)
+    with output_area:
+        display(fig)
+
+def plot_beta_up_down():
+    window = rolling_window_widget.value
+    threshold = spot_return_threshold_widget.value
+    spot = df_raw[df_raw["Category"]=="Spot"].copy()
+    atm  = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    if spot.empty or atm.empty:
+        return
+    spot.sort_values("DATE", inplace=True)
+    spot["Ret_spot"] = safe_log_ratio(spot["Value"])
+    data_up = []
+    data_down = []
+    for tn in atm["Tenor"].unique():
+        sub = atm[atm["Tenor"]==tn].copy()
+        sub.sort_values("DATE", inplace=True)
+        sub["Ret_atm"] = safe_log_ratio(sub["Value"])
+        merged = pd.merge(spot[["DATE","Ret_spot"]], sub[["DATE","Ret_atm"]], on="DATE", how="inner")
+        merged.set_index("DATE", inplace=True)
+        up_series = pd.Series(index=merged.index, dtype=float)
+        down_series = pd.Series(index=merged.index, dtype=float)
+        for i in range(window-1, len(merged)):
+            slice_ = merged.iloc[i-window+1 : i+1]
+            up_slice = slice_[slice_["Ret_spot"]>=threshold]
+            down_slice = slice_[slice_["Ret_spot"]<=-threshold]
+            if len(up_slice)>=2:
+                cov_up = up_slice["Ret_atm"].cov(up_slice["Ret_spot"])
+                var_up = up_slice["Ret_spot"].var()
+                if var_up!=0:
+                    up_series.iloc[i] = (cov_up/var_up)/10.0
+            if len(down_slice)>=2:
+                cov_down = down_slice["Ret_atm"].cov(down_slice["Ret_spot"])
+                var_down = down_slice["Ret_spot"].var()
+                if var_down!=0:
+                    down_series.iloc[i] = (cov_down/var_down)/10.0
+        up_df = up_series.reset_index()
+        up_df.columns = ["DATE","BetaUp"]
+        up_df["Tenor"] = tn
+        data_up.append(up_df)
+        down_df = down_series.reset_index()
+        down_df.columns = ["DATE","BetaDown"]
+        down_df["Tenor"] = tn
+        data_down.append(down_df)
+    df_up = pd.concat(data_up, ignore_index=True)
+    df_down = pd.concat(data_down, ignore_index=True)
+    # Beta Up
+    df_up.sort_values(["Tenor","DATE"], inplace=True)
+    cat_orders_up = build_category_orders_for_tenor(df_up, "Tenor")
+    fig_up = px.line(df_up, x="DATE", y="BetaUp", color="Tenor", category_orders=cat_orders_up)
+    for trace in fig_up.data:
+        tenor = trace.name
+        sub = df_up[df_up["Tenor"]==tenor]
+        if not sub.empty:
+            val = sub["BetaUp"].iloc[-1]
+            if pd.notna(val):
+                trace.name = f"{tenor} {val:.3f}"
+    fig_up.add_hline(y=0, line_color='red', line_width=1)
+    connect_gaps_traces(fig_up)
+    update_fig_title(fig_up, f"{current_pair} Beta Spot UP(thr={threshold}, w={window})")
+    fig_up.update_layout(showlegend=True)
+    with output_area:
+        display(fig_up)
+    # Beta Down
+    df_down.sort_values(["Tenor","DATE"], inplace=True)
+    cat_orders_down = build_category_orders_for_tenor(df_down, "Tenor")
+    fig_down = px.line(df_down, x="DATE", y="BetaDown", color="Tenor", category_orders=cat_orders_down)
+    for trace in fig_down.data:
+        tenor = trace.name
+        sub = df_down[df_down["Tenor"]==tenor]
+        if not sub.empty:
+            val = sub["BetaDown"].iloc[-1]
+            if pd.notna(val):
+                trace.name = f"{tenor} {val:.3f}"
+    fig_down.add_hline(y=0, line_color='red', line_width=1)
+    connect_gaps_traces(fig_down)
+    update_fig_title(fig_down, f"{current_pair} Beta Spot DOWN(thr={threshold}, w={window})")
+    fig_down.update_layout(showlegend=True)
+    with output_area:
+        display(fig_down)
+
+def plot_calendar_zscore():
+    window = rolling_window_widget.value
+    atm_df = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    if atm_df.empty:
+        return
+    pivot_atm = atm_df.pivot(index="DATE", columns="Tenor", values="Value").sort_index()
+    sorted_tenors = sorted([c for c in pivot_atm.columns if pd.notna(c)], key=parse_tenor_str)
+    pivot_atm = pivot_atm[sorted_tenors]
+    if len(pivot_atm) < window:
+        with output_area:
+            print("Pas assez de points pour le Calendar ZScore.")
+        return
+    pivot_recent = pivot_atm.iloc[-window:].copy()
+    n = len(sorted_tenors)
+    z_matrix = np.full((n, n), np.nan)
+    for i in range(n):
+        for j in range(i+1, n):
+            spread_series = pivot_recent.iloc[:, j] - pivot_recent.iloc[:, i]
+            mean_spread = spread_series.mean()
+            std_spread  = spread_series.std()
+            curr_spread = pivot_atm.iloc[-1, j] - pivot_atm.iloc[-1, i]
+            if pd.notna(std_spread) and std_spread != 0:
+                z_matrix[i,j] = (curr_spread - mean_spread)/std_spread
+    fig = px.imshow(z_matrix, x=sorted_tenors, y=sorted_tenors, origin='lower',
+                    color_continuous_scale=[
+                        [0.0,  "#E0B0FF"],
+                        [0.25, "#E6E6FA"],
+                        [0.50, "#FFFFFF"],
+                        [0.75, "#4169E1"],
+                        [1.0,  "#4169E1"]
+                    ],
+                    range_color=(-3,3),
+                    labels=dict(color="Z-Score"))
+    fig.update_layout(
+        width=900, height=500,
+        xaxis_title="Longer Tenor", yaxis_title="Shorter Tenor",
+        showlegend=True
+    )
+    update_fig_title(fig, f"{current_pair} ATM Calendar Spread Z-Score (window={window})")
+    annotations = []
+    for i in range(n):
+        for j in range(i+1, n):
+            val = z_matrix[i,j]
+            if pd.notna(val):
+                txt = f"{val:.2f}"
+                color_ = "red" if val < 0 else "blue"
+                annotations.append(dict(
+                    x=sorted_tenors[j], y=sorted_tenors[i],
+                    text=txt, showarrow=False,
+                    font=dict(color=color_, size=12),
+                    xref="x", yref="y", xanchor="center", yanchor="middle"
+                ))
+    fig.update_layout(annotations=annotations)
+    with output_area:
+        display(fig)
+
+def plot_stationarity_zscore():
+    window = rolling_window_widget.value
+    atm_df = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    if atm_df.empty:
+        return
+    pivot_atm = atm_df.pivot(index="DATE", columns="Tenor", values="Value").sort_index()
+    if len(pivot_atm) < window:
+        with output_area:
+            print("Pas assez de points pour le test ADF sur MeanZScore.")
+        return
+    z_pivot = (pivot_atm - pivot_atm.rolling(window).mean()) / pivot_atm.rolling(window).std()
+    z_pivot["MeanZ"] = z_pivot.mean(axis=1, skipna=True)
+    mean_z = z_pivot["MeanZ"].dropna()
+    if len(mean_z) < 30:
+        with output_area:
+            print("Pas assez de points (≥30) pour un test ADF sur MeanZScore.")
+        return
+    res = adfuller(mean_z, autolag='AIC')
+    stat_adf = res[0]
+    p_val = res[1]
+    crit_vals = res[4]
+    with output_area:
+        print("[ADF sur MeanZScore]")
+        print(f"ADF Stat: {stat_adf:.4f}, p-value: {p_val:.4f}")
+        for k, v in crit_vals.items():
+            print(f" Crit {k}: {v:.4f}")
+        if p_val < 0.05:
+            print("Conclusion: stationnaire (5%).")
+        else:
+            print("Conclusion: non stationnaire.")
+    hl = compute_AR1_half_life(mean_z)
+    with output_area:
+        if pd.notna(hl):
+            print(f"Half-life AR(1): {hl:.1f} jours.\n")
+        else:
+            print("Half-life AR(1) non définie.\n")
+
+########################################
+# Fonction principale run_script
+########################################
+
+def run_script(b):
+    global stop_flag, current_pair, df_raw
+    run_button.disabled = True
+    stop_button.disabled = False
+    progress_bar.value = 0
+    output_area.clear_output(wait=True)
+
+    # Récupération des paramètres
+    current_pair = pair_widget.value
+    selected_tenors = list(tenors_widget.value)
+    start_date = start_date_widget.value.strftime("%Y-%m-%d") if start_date_widget.value else "2018-01-18"
+    end_date_dt = end_date_widget.value if end_date_widget.value else datetime.today()
+    end_date_str = end_date_dt.strftime("%Y-%m-%d")
+    
+    with output_area:
+        print(f"Pair: {current_pair}")
+        print(f"Tenors: {selected_tenors}")
+        print(f"Start date: {start_date}")
+        print(f"End date: {end_date_str}")
+
+    # Récupération BQL
+    progress_bar.value = 10
+    bq_svc = bql.Service()
+    tickers = [f"{current_pair} BGN Curncy"]
+    for t in selected_tenors:
+        tickers.append(f"{current_pair}{'12M' if t=='1Y' else t} BGN Curncy")
+        tickers.append(f"{current_pair}V{'1Y' if t=='1Y' else t} BGN Curncy")
+        tickers.append(f"{current_pair}25R{'1Y' if t=='1Y' else t} BGN Curncy")
+        tickers.append(f"{current_pair}25B{'1Y' if t=='1Y' else t} BGN Curncy")
+        tickers.append(f"{current_pair}10R{'1Y' if t=='1Y' else t} BGN Curncy")
+        tickers.append(f"{current_pair}10B{'1Y' if t=='1Y' else t} BGN Curncy")
+
+    px_item = bq_svc.data.px_last(dates=bq_svc.func.range(start_date, end_date_str))
+    resp = bq_svc.execute(bql.Request(tickers, px_item))
+    df_local = resp[0].df().reset_index()
+    px_cols = [c for c in df_local.columns if "PX_LAST" in c.upper()]
+    if not px_cols:
+        with output_area:
+            print("No PX_LAST column found => abort.")
+        run_button.disabled = False
+        stop_button.disabled = True
+        return
+    df_local.rename(columns={px_cols[0]: "Value"}, inplace=True)
+
+    df_local["Category"] = df_local["ID"].apply(detect_category)
+    df_local["Tenor"] = df_local["ID"].apply(extract_tenor)
+    df_local["DATE"] = pd.to_datetime(df_local["DATE"])
+    df_local = df_local[(df_local["DATE"]>=pd.to_datetime(start_date)) & (df_local["DATE"]<=pd.to_datetime(end_date_str))]
+    df_local = df_local[df_local["DATE"].dt.dayofweek < 5]
+    df_local.sort_values("DATE", inplace=True)
+    df_raw = df_local.copy()
+
+    progress_bar.value = 30
+
+    with output_area:
+        print("Affichage des graphiques...")
+
+    if check_spot.value:
+        plot_spot()
+
+    if check_atm.value:
+        plot_atm()
+
+    if check_25d_rr.value:
+        plot_25d_rr()
+
+    if check_25d_bf.value:
+        plot_25d_bf()
+
+    if check_10d_rr.value:
+        plot_10d_rr()
+
+    if check_10d_bf.value:
+        plot_10d_bf()
+
+    if check_realized_vol.value:
+        plot_realized_vol()
+
+    if check_correlation.value:
+        plot_correlation()
+
+    if check_vol_of_vol.value:
+        plot_vol_of_vol()
+
+    if check_zscore.value:
+        plot_zscore()
+
+    if check_mean_zscore.value:
+        plot_mean_zscore()
+
+    if check_beta.value:
+        plot_beta()
+
+    if check_beta_up_down.value:
+        plot_beta_up_down()
+
+    if check_calendar.value:
+        plot_calendar_zscore()
+
+    if check_stationarity.value:
+        plot_stationarity_zscore()
+
+    progress_bar.value = 90
+
+    with output_area:
+        print("[OK] Script terminé.")
+    progress_bar.value = 100
+    run_button.disabled = False
+    stop_button.disabled = True
+
+def stop_execution(b):
+    global stop_flag
+    stop_flag = True
+    with output_area:
+        print("Stop signal reçu...")
+
+run_button.on_click(run_script)
+stop_button.on_click(stop_execution)
