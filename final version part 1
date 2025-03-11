@@ -1,0 +1,1089 @@
+import bql
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import re
+from datetime import datetime
+
+# Added statsmodels for AR(1) and ADF
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import adfuller
+
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+# =============================================================================
+# [INTERFACE] Widgets for configuration
+# =============================================================================
+
+pair_widget = widgets.Text(
+    value="EURUSD",
+    description="Currency Pair:"
+)
+
+tenors_widget = widgets.Text(
+    value="1M,2M,3M,6M,9M,1Y",
+    description="Tenors List:"
+)
+
+start_date_widget = widgets.DatePicker(
+    value=datetime(2023, 1, 18),
+    description="Start Date"
+)
+
+end_date_widget = widgets.DatePicker(
+    value=datetime.today(),
+    description="End Date"
+)
+
+# Shortened descriptions so they fit
+rolling_window_widget = widgets.IntSlider(
+    value=100, 
+    min=10, 
+    max=365, 
+    step=10, 
+    description="Roll Win"
+)
+
+realized_windows_widget = widgets.Text(
+    value="5,10,30,90", 
+    description="Real Win"
+)
+
+spot_return_threshold_widget = widgets.FloatSlider(
+    value=0.0015,
+    min=0.001,
+    max=0.01,
+    step=0.0005,
+    description="Spot Thr.",
+    readout=True,
+    readout_format=".2%"  # show in percentage 
+)
+
+progress_bar = widgets.IntProgress(
+    value=0, 
+    min=0, 
+    max=100, 
+    description="Progress"
+)
+
+run_button = widgets.Button(
+    description="Run Script", 
+    button_style='success'
+)
+stop_button = widgets.Button(
+    description="Stop", 
+    button_style='danger',
+    disabled=True
+)
+
+# --- Checkboxes to enable/disable certain features ---
+check_spot = widgets.Checkbox(value=True, description="Show Spot & Fwds Chart")
+check_atm = widgets.Checkbox(value=True, description="Show ATM Vol")
+check_25d_rr = widgets.Checkbox(value=False, description="Show 25D RR")
+check_25d_bf = widgets.Checkbox(value=False, description="Show 25D BF")
+check_10d_rr = widgets.Checkbox(value=False, description="Show 10D RR")
+check_10d_bf = widgets.Checkbox(value=False, description="Show 10D BF")
+check_realized_vol = widgets.Checkbox(value=True, description="Show Realized Vol")
+check_correlation = widgets.Checkbox(value=True, description="Show Corr (Spot/ATM)")
+check_vol_forward_corr = widgets.Checkbox(value=True, description="Show Vol/Forward Corr")
+check_vol_of_vol = widgets.Checkbox(value=True, description="Show Vol of Vol")
+check_zscore = widgets.Checkbox(value=True, description="Show Z-Score(ATM)")
+check_mean_zscore = widgets.Checkbox(value=True, description="Show Mean Z-Score(ATM)")
+check_beta = widgets.Checkbox(value=True, description="Show Beta(Vol vs Spot)")
+check_beta_up_down = widgets.Checkbox(value=True, description="Show Beta Spot Up/Down")
+check_calendar = widgets.Checkbox(value=True, description="Show Calendar Z-Score")
+check_stationarity = widgets.Checkbox(value=True, description="Show Stationarity Z")
+
+# Create an HBox for the buttons to align them
+buttons_layout = widgets.HBox([run_button, stop_button])
+
+# Organize checkboxes into two columns
+checkbox_column1 = widgets.VBox([
+    check_spot,
+    check_atm,
+    check_25d_rr,
+    check_25d_bf,
+    check_10d_rr,
+    check_10d_bf,
+    check_realized_vol,
+    check_correlation
+])
+
+checkbox_column2 = widgets.VBox([
+    check_vol_forward_corr,
+    check_vol_of_vol,
+    check_zscore,
+    check_mean_zscore,
+    check_beta,
+    check_beta_up_down,
+    check_calendar,
+    check_stationarity
+])
+
+# Combine the columns into a single layout
+checkboxes_layout = widgets.HBox([checkbox_column1, checkbox_column2])
+
+# A vertical layout (single-column) for clarity
+ui = widgets.VBox([
+    pair_widget,
+    tenors_widget,
+    start_date_widget,
+    end_date_widget,
+    rolling_window_widget,
+    realized_windows_widget,
+    spot_return_threshold_widget,
+    buttons_layout,  # Use the HBox for buttons here
+    checkboxes_layout,  # Add the checkboxes layout here
+    progress_bar
+])
+
+output_area = widgets.Output()
+
+# Display the UI and the output area
+display(ui)
+display(output_area)
+
+# --- Variable to stop execution ---
+stop_flag = False
+
+def on_stop_button_clicked(b):
+    global stop_flag
+    stop_flag = True
+    with output_area:
+        print("Stop requested, execution will halt soon...")
+
+stop_button.on_click(on_stop_button_clicked)
+
+# =============================================================================
+# [PART 1] Definition of functions and initial structures
+# =============================================================================
+
+# -- Global variables (will be updated via UI) --
+pair = "EURUSD"
+tenors = ["1M", "2M", "3M", "6M", "9M", "1Y"]
+start_date = '2023-01-18'
+end_date = datetime.today()
+rolling_windows = [100]    
+realized_windows = [5, 10, 30, 90]
+spot_return_threshold = 0.002
+
+title_spot            = f"{pair} - Spot"
+title_atm_vol         = f"{pair} - ATM Vol"
+title_25d_rr          = f"{pair} - 25D Risk Reversal"
+title_25d_bf          = f"{pair} - 25D Butterfly"
+title_10d_rr          = f"{pair} - 10D Risk Reversal"
+title_10d_bf          = f"{pair} - 10D Butterfly"
+
+title_corr_template   = f"{pair} - {{window}} days Vol/Spot Correlation"
+title_volvol_template = f"{pair} - {{window}} days ATM Vol de Vol"
+title_beta_template   = f"{pair} - {{window}} days Vol Beta (Vol pts per 1% Spot Move)"
+title_zscore_template = f"{pair} - {{window}} days Vol Z-Score"
+title_meanz_template  = f"{pair} - {{window}} days Mean Vol Z-Score"
+
+title_beta_up_template   = ""
+title_beta_down_template = ""
+
+title_realized_vol    = f"{pair} - Realized Volatility (Daily)"
+title_calendar_template = f"{pair} - ATM Calendar Spreads Z-Score Matrix (Window={{win}} days)"
+
+line_style = dict(width=1.3, dash='solid')
+layout_conf = dict(
+    template="plotly_dark",
+    autosize=False,
+    width=900,
+    height=500,
+    plot_bgcolor="rgba(55,55,55,1)",
+    paper_bgcolor="rgba(55,55,55,1)",
+    margin=dict(l=60, r=80, t=80, b=60),
+    dragmode='pan',
+    xaxis=dict(gridcolor="rgba(255,255,255,0.3)", gridwidth=0.5, tickfont=dict(size=14)),
+    yaxis=dict(gridcolor="rgba(255,255,255,0.3)", gridwidth=0.5, tickfont=dict(size=14)),
+    legend=dict(
+        orientation='v', x=1.02, y=0.5, xanchor='left', yanchor='middle',
+        bgcolor='rgba(15,15,15,0.6)', bordercolor='rgba(200,200,200,0.4)', borderwidth=1,
+        font=dict(color='white', size=12), itemsizing='constant', tracegroupgap=10
+    ),
+)
+plotly_config = dict(scrollZoom=True)
+
+df_raw = pd.DataFrame()
+df_spot_return   = pd.DataFrame()
+df_corr_final    = pd.DataFrame()
+df_volvol_final  = pd.DataFrame()
+df_beta_final    = pd.DataFrame()
+df_zscore_final  = pd.DataFrame()
+df_beta_up_down  = pd.DataFrame()
+df_calendar_info = pd.DataFrame()
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+def safe_log_ratio(series, eps=1e-8):
+    ratio = series / series.shift(1)
+    ratio = ratio.clip(lower=eps)
+    return np.log(ratio)
+
+def update_fig_title(fig, title_text):
+    fig.update_layout(
+        title=dict(text=title_text, x=0.5, xanchor='center',
+                   font=dict(size=18, color="white", family="Arial Black"))
+    )
+    fig.update_layout(**layout_conf)
+
+def connect_gaps_traces(fig):
+    fig.update_traces(connectgaps=True)
+
+def detect_category(ticker: str):
+    t_up = ticker.upper().replace(" BGN CURNCY", "").strip()
+    if t_up == pair.upper():
+        return "Spot"
+    if "V" in t_up:
+        return "ATM_vol"
+    if "25R" in t_up:
+        return "25D RR"
+    if "25B" in t_up:
+        return "25D BF"
+    if "10R" in t_up:
+        return "10D RR"
+    if "10B" in t_up:
+        return "10D BF"
+    return "Forward"
+
+def extract_tenor(ticker: str):
+    match = re.search(r"(\d+[WMY])", ticker.upper())
+    return match.group(1) if match else np.nan
+
+def tenor_to_float(ten_str: str) -> float:
+    if not isinstance(ten_str, str):
+        return np.nan
+    s = ten_str.upper()
+    if 'W' in s: 
+        return float(s[:-1]) / 52
+    if 'M' in s: 
+        return float(s[:-1]) / 12
+    if 'Y' in s: 
+        return float(s[:-1])
+    return np.nan
+
+def build_legend_info(df_cat, tenor_col="Tenor", val_col="Value", fmt=".2f"):
+    last_vals = df_cat.groupby(tenor_col)[val_col].last().reset_index()
+    last_vals["TenorFloat"] = last_vals[tenor_col].apply(tenor_to_float)
+    last_vals.sort_values("TenorFloat", inplace=True)
+    legend_map = {}
+    for _, row in last_vals.iterrows():
+        tn, v = row[tenor_col], row[val_col]
+        legend_map[tn] = f"{tn} {v:{fmt}}" if pd.notna(tn) else f"Unknown {v:{fmt}}"
+    df_cat["TenorLegend"] = df_cat[tenor_col].map(legend_map)
+    sorted_legends = [legend_map[t] for t in last_vals[tenor_col]]
+    return df_cat, sorted_legends
+
+def compute_AR1_half_life(series: pd.Series) -> float:
+    s = series.dropna()
+    if len(s) < 5:
+        return np.nan
+    Y = s[1:].values
+    X = s[:-1].values
+    X = sm.add_constant(X)
+    if len(Y) != len(X):
+        return np.nan
+    model = sm.OLS(Y, X, missing='drop')
+    res = model.fit()
+    if len(res.params) < 2:
+        return np.nan
+    phi = res.params[1]
+    if abs(phi) >= 1:
+        return np.nan
+    half_life = -np.log(2) / np.log(abs(phi))
+    return half_life
+
+def ensure_columns(df, cols):
+    for col in cols:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df
+
+# =============================================================================
+# PLOT/ANALYSIS FUNCTIONS
+# =============================================================================
+def plot_spot():
+    # Filter the spot data
+    spot_df = df_raw[df_raw["Category"] == "Spot"].copy()
+    if spot_df.empty:
+        return
+
+    # Filter the forward rates data
+    forward_df = df_raw[df_raw["Category"] == "Forward"].copy()
+    if forward_df.empty:
+        return
+
+    # Plot the spot data
+    last_spot = spot_df["Value"].iloc[-1]
+    fig = px.line(spot_df, x="DATE", y="Value", title="")
+    fig.update_traces(name=f"Spot {last_spot:.4f}", showlegend=True, line=dict(color='white', width=1.0))  # Thinner line
+
+    # Plot the forward rates data
+    forward_df, sorted_legs = build_legend_info(forward_df, fmt=".4f")
+    for tenor in sorted_legs:
+        tenor_df = forward_df[forward_df["TenorLegend"] == tenor]
+        fig.add_trace(go.Scatter(
+            x=tenor_df["DATE"], 
+            y=tenor_df["Value"], 
+            mode='lines', 
+            name=tenor,
+            line=dict(width=1.0)  # Thinner line
+        ))
+
+    # Connect gaps and update the figure title
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{pair} - Spot and Forward Rates")
+    fig.show(config=plotly_config)
+    
+def plot_basic_categories():
+    categories = []
+    if check_atm.value:
+        categories.append(("ATM_vol", f"{pair} - ATM Vol", False))
+    if check_25d_rr.value:
+        categories.append(("25D RR", f"{pair} - 25D Risk Reversal", True))
+    if check_25d_bf.value:
+        categories.append(("25D BF", f"{pair} - 25D Butterfly", False))
+    if check_10d_rr.value:
+        categories.append(("10D RR", f"{pair} - 10D Risk Reversal", True))
+    if check_10d_bf.value:
+        categories.append(("10D BF", f"{pair} - 10D Butterfly", False))
+
+    for cat, title_text, zero_line in categories:
+        df_cat = df_raw[df_raw["Category"] == cat].copy()
+        if df_cat.empty:
+            continue
+        df_cat, sorted_legs = build_legend_info(df_cat)
+        fig = px.line(df_cat, x="DATE", y="Value", color="TenorLegend",
+                      category_orders={"TenorLegend": sorted_legs})
+        fig.update_traces(line=line_style)
+        connect_gaps_traces(fig)
+        update_fig_title(fig, title_text)
+        if zero_line:
+            fig.add_hline(y=0, line_color='red', line_width=2)
+        fig.update_layout(legend_title_text="")
+        fig.show(config=plotly_config)
+
+def plot_correlation():
+    global df_corr_final
+    window = rolling_windows[0]
+    spot = df_raw[df_raw["Category"]=="Spot"].copy()
+    spot["Return"] = safe_log_ratio(spot["Value"])
+    spot.set_index("DATE", inplace=True)
+    atm = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    atm.set_index("DATE", inplace=True)
+
+    corr_df = pd.DataFrame(index=spot.index)
+    for tenor in atm["Tenor"].unique():
+        sub = atm[atm["Tenor"]==tenor].copy()
+        sub["Return"] = safe_log_ratio(sub["Value"])
+        merged = spot[["Return"]].join(sub[["Return"]], lsuffix='_spot', rsuffix='_atm')
+        corr_rolling = merged['Return_spot'].rolling(window, min_periods=window).corr(merged['Return_atm'])
+        corr_df[tenor] = corr_rolling
+
+    corr_df.reset_index(inplace=True)
+    df_corr_long = corr_df.melt(id_vars="DATE", var_name="Tenor", value_name="Corr")
+    df_corr_final = df_corr_long.copy()
+    df_corr_long, sorted_legs = build_legend_info(df_corr_long, "Tenor", "Corr", fmt=".2%")
+
+    fig = px.line(df_corr_long, x="DATE", y="Corr", color="TenorLegend",
+                  category_orders={"TenorLegend": sorted_legs})
+    fig.update_traces(line=line_style)
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{pair} - {window} days Vol/Spot Correlation")
+    fig.update_layout(yaxis_tickformat=".2%")
+    fig.add_shape(type="line", x0=df_corr_long["DATE"].min(), x1=df_corr_long["DATE"].max(),
+                  y0=0, y1=0, line=dict(color="red"))
+    fig.update_layout(legend_title_text="")
+    fig.show(config=plotly_config)
+    
+def plot_vol_forward_correlation():
+    global df_raw
+    window = rolling_windows[0]
+
+    # Filter ATM volatility and forward data
+    atm_vol_df = df_raw[df_raw["Category"] == "ATM_vol"].copy()
+    forward_df = df_raw[df_raw["Category"] == "Forward"].copy()
+
+    # Ensure both dataframes are not empty
+    if atm_vol_df.empty or forward_df.empty:
+        print("No data available for ATM volatility or forward rates.")
+        return
+
+    # Set index to DATE for both dataframes
+    atm_vol_df.set_index("DATE", inplace=True)
+    forward_df.set_index("DATE", inplace=True)
+
+    # Mapping to handle the 1Y/12M discrepancy
+    tenor_mapping = {"1Y": "12M"}
+
+    # Calculate correlation
+    corr_df = pd.DataFrame(index=atm_vol_df.index)
+    for tenor in atm_vol_df["Tenor"].unique():
+        # Map the tenor if necessary
+        forward_tenor = tenor_mapping.get(tenor, tenor)
+
+        vol_sub = atm_vol_df[atm_vol_df["Tenor"] == tenor].copy()
+        fwd_sub = forward_df[forward_df["Tenor"] == forward_tenor].copy()
+
+        # Calculate returns
+        vol_sub["Return"] = safe_log_ratio(vol_sub["Value"])
+        fwd_sub["Return"] = safe_log_ratio(fwd_sub["Value"])
+
+        # Merge and calculate rolling correlation
+        merged = vol_sub[["Return"]].join(fwd_sub[["Return"]], lsuffix='_vol', rsuffix='_fwd')
+        corr_rolling = merged['Return_vol'].rolling(window, min_periods=window).corr(merged['Return_fwd'])
+        corr_df[tenor] = corr_rolling
+
+    # Reset index for plotting
+    corr_df.reset_index(inplace=True)
+    df_corr_long = corr_df.melt(id_vars="DATE", var_name="Tenor", value_name="Corr")
+    df_corr_long, sorted_legs = build_legend_info(df_corr_long, "Tenor", "Corr", fmt=".2%")
+
+    # Plot
+    fig = px.line(df_corr_long, x="DATE", y="Corr", color="TenorLegend",
+                  category_orders={"TenorLegend": sorted_legs})
+    fig.update_traces(line=line_style)
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{pair} - {window} days Vol/Forward Correlation")
+    fig.update_layout(yaxis_tickformat=".2%")
+    fig.add_shape(type="line", x0=df_corr_long["DATE"].min(), x1=df_corr_long["DATE"].max(),
+                  y0=0, y1=0, line=dict(color="red"))
+    fig.update_layout(legend_title_text="")
+    fig.show(config=plotly_config)
+    
+def plot_vol_of_vol():
+    global df_volvol_final
+    window = rolling_windows[0]
+    atm = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    atm.set_index("DATE", inplace=True)
+    volvol_df = pd.DataFrame(index=atm.index)
+    for tenor in atm["Tenor"].unique():
+        sub = atm[atm["Tenor"]==tenor].copy()
+        sub["VolReturn"] = np.log(sub["Value"] / sub["Value"].shift(1))
+        vol = sub["VolReturn"].rolling(window, min_periods=window).std() * np.sqrt(260)
+        volvol_df[tenor] = vol
+    volvol_df.reset_index(inplace=True)
+    df_m = volvol_df.melt(id_vars="DATE", var_name="Tenor", value_name="VolOfVol")
+    df_volvol_final = df_m.copy()
+    df_m, sorted_legs = build_legend_info(df_m, "Tenor", "VolOfVol", fmt=".2%")
+    fig = px.line(df_m, x="DATE", y="VolOfVol", color="TenorLegend",
+                  category_orders={"TenorLegend": sorted_legs},
+                  labels={"VolOfVol": "Vol of Vol (annualized, base 260)"})
+    fig.update_traces(line=line_style)
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{pair} - {window} days ATM Vol de Vol")
+    fig.update_layout(yaxis_tickformat=".2%")
+    fig.add_shape(type="line", x0=volvol_df["DATE"].min(), x1=volvol_df["DATE"].max(),
+                  y0=0, y1=0, line=dict(color="red"))
+    fig.update_layout(legend_title_text="")
+    fig.show(config=plotly_config)
+
+def plot_beta():
+    global df_beta_final
+    window = rolling_windows[0]
+    spot = df_raw[df_raw["Category"]=="Spot"].copy()
+    spot["Return"] = safe_log_ratio(spot["Value"])
+    spot.set_index("DATE", inplace=True)
+    atm = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    atm.set_index("DATE", inplace=True)
+    beta_df = pd.DataFrame(index=spot.index)
+    for tenor in atm["Tenor"].unique():
+        sub = atm[atm["Tenor"]==tenor].copy()
+        sub["Return"] = safe_log_ratio(sub["Value"])
+        merged = spot[["Return"]].join(sub[["Return"]], lsuffix='_spot', rsuffix='_atm')
+        cov = merged["Return_atm"].rolling(window, min_periods=window).cov(merged["Return_spot"])
+        var = merged["Return_spot"].rolling(window, min_periods=window).var()
+        beta_df[tenor] = (cov / var) / 10.0
+    beta_df.reset_index(inplace=True)
+    df_melt = beta_df.melt(id_vars="DATE", var_name="Tenor", value_name="Beta")
+    df_beta_final = df_melt.copy()
+    df_melt, sorted_legs = build_legend_info(df_melt, "Tenor", "Beta")
+    fig = px.line(df_melt, x="DATE", y="Beta", color="TenorLegend",
+                  category_orders={"TenorLegend": sorted_legs},
+                  labels={"Beta": "Beta (Vol pts per 1% Spot Move)"})
+    fig.update_traces(line=line_style)
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{pair} - {window} days Vol Beta (Vol pts per 1% Spot Move)")
+    fig.add_shape(type="line", x0=beta_df["DATE"].min(), x1=beta_df["DATE"].max(),
+                  y0=0, y1=0, line=dict(color="red"))
+    fig.update_layout(legend_title_text="")
+    fig.show(config=plotly_config)
+
+def plot_zscore():
+    global df_zscore_final
+    window = rolling_windows[0]
+    spot = df_raw[df_raw["Category"]=="Spot"].copy()
+    spot["Return"] = safe_log_ratio(spot["Value"])
+    spot.set_index("DATE", inplace=True)
+    atm = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    atm.set_index("DATE", inplace=True)
+    z_df = pd.DataFrame(index=spot.index)
+    for tenor in atm["Tenor"].unique():
+        sub = atm[atm["Tenor"]==tenor].copy()
+        mean_val = sub["Value"].rolling(window, min_periods=window).mean()
+        std_val  = sub["Value"].rolling(window, min_periods=window).std()
+        z_df[tenor] = (sub["Value"] - mean_val) / (std_val)
+    z_df.reset_index(inplace=True)
+    df_melt = z_df.melt(id_vars="DATE", var_name="Tenor", value_name="ZScore")
+    df_zscore_final = df_melt.copy()
+    df_melt, sorted_legs = build_legend_info(df_melt, "Tenor", "ZScore")
+    fig = px.line(df_melt, x="DATE", y="ZScore", color="TenorLegend",
+                  category_orders={"TenorLegend": sorted_legs},
+                  labels={"ZScore": "Z-Score"})
+    fig.update_traces(line=line_style, showlegend=True)
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{pair} - {window} days Vol Z-Score")
+    fig.add_shape(type="line", x0=z_df["DATE"].min(), x1=z_df["DATE"].max(),
+                  y0=0, y1=0, line=dict(color="red"))
+    fig.update_layout(legend_title_text="")
+    fig.show(config=plotly_config)
+
+def plot_mean_zscore():
+    window = rolling_windows[0]
+    spot = df_raw[df_raw["Category"]=="Spot"].copy()
+    spot["Return"] = safe_log_ratio(spot["Value"])
+    spot.set_index("DATE", inplace=True)
+    atm = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    atm.set_index("DATE", inplace=True)
+    z_df = pd.DataFrame(index=spot.index)
+    for tenor in atm["Tenor"].unique():
+        sub = atm[atm["Tenor"]==tenor].copy()
+        mean_val = sub["Value"].rolling(window, min_periods=window).mean()
+        std_val  = sub["Value"].rolling(window, min_periods=window).std()
+        z_df[tenor] = (sub["Value"] - mean_val) / (std_val)
+    z_df.reset_index(inplace=True)
+    z_df["MeanZScore"] = z_df.drop(columns="DATE").mean(axis=1)
+    fig = px.line(z_df, x="DATE", y="MeanZScore", labels={"MeanZScore": "Mean Z-Score"})
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{pair} - {window} days Mean Vol Z-Score")
+    fig.add_shape(type="line", x0=z_df["DATE"].min(), x1=z_df["DATE"].max(),
+                  y0=0, y1=0, line=dict(color="red"))
+    last_val = z_df["MeanZScore"].iloc[-1]
+    fig.update_traces(name=f"MeanZScore {last_val:.2f}", showlegend=True)
+    fig.show(config=plotly_config)
+
+def plot_beta_spot():
+    """
+    Beta Spot Up/Down can yield extreme values if the local slice is too small or
+    if variance is near zero. We'll skip those cases by imposing stricter thresholds:
+      - min_points = 5
+      - min_var    = 1e-8
+      - beta_clamp = 10 (i.e. if Beta > 10, we set it to NaN to avoid huge spikes)
+    """
+    global df_beta_up_down
+    window = rolling_windows[0]
+
+    spot = df_raw[df_raw["Category"]=="Spot"].copy()
+    spot["Return"] = safe_log_ratio(spot["Value"])
+    spot.set_index("DATE", inplace=True)
+
+    atm = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    atm.set_index("DATE", inplace=True)
+
+    beta_up_df = pd.DataFrame(index=spot.index)
+    beta_down_df = pd.DataFrame(index=spot.index)
+
+    # Safeguards
+    min_points = 5      # skip if fewer than 5 points in slice
+    min_var    = 1e-8   # skip if var is extremely low
+    beta_clamp = 10     # clamp any Beta > 10 to NaN (optional)
+
+    for tenor in atm["Tenor"].unique():
+        sub = atm[atm["Tenor"]==tenor].copy()
+        sub["Return"] = safe_log_ratio(sub["Value"])
+        merged = spot[["Return"]].join(sub[["Return"]], how='inner', lsuffix='_spot', rsuffix='_atm')
+
+        up_series = pd.Series(index=merged.index, dtype=float)
+        down_series = pd.Series(index=merged.index, dtype=float)
+
+        # Manual rolling approach
+        for i in range(window - 1, len(merged)):
+            if stop_flag:
+                return
+            slice_ = merged.iloc[i - window + 1 : i + 1]
+            up_slice   = slice_[slice_["Return_spot"] >= spot_return_threshold]
+            down_slice = slice_[slice_["Return_spot"] <= -spot_return_threshold]
+
+            # Beta Spot UP
+            if len(up_slice) >= min_points:
+                cov_up = up_slice["Return_atm"].cov(up_slice["Return_spot"])
+                var_up = up_slice["Return_spot"].var()
+                if var_up > min_var:
+                    val_up = (cov_up / var_up) / 10.0
+                    # clamp if too big
+                    if abs(val_up) > beta_clamp:
+                        val_up = np.nan
+                    up_series.iloc[i] = val_up
+
+            # Beta Spot DOWN
+            if len(down_slice) >= min_points:
+                cov_down = down_slice["Return_atm"].cov(down_slice["Return_spot"])
+                var_down = down_slice["Return_spot"].var()
+                if var_down > min_var:
+                    val_down = (cov_down / var_down) / 10.0
+                    if abs(val_down) > beta_clamp:
+                        val_down = np.nan
+                    down_series.iloc[i] = val_down
+
+        beta_up_df[tenor] = up_series
+        beta_down_df[tenor] = down_series
+
+    beta_up_df.reset_index(inplace=True)
+    beta_down_df.reset_index(inplace=True)
+
+    df_up = beta_up_df.melt(id_vars="DATE", var_name="Tenor", value_name="Beta_Spot_UP")
+    df_down = beta_down_df.melt(id_vars="DATE", var_name="Tenor", value_name="Beta_Spot_DOWN")
+    df_beta_up_down = pd.merge(df_up, df_down, on=["DATE", "Tenor"], how="outer")
+
+    # Graph Beta Spot UP
+    fig_up_data, sorted_legs_up = build_legend_info(df_up, "Tenor", "Beta_Spot_UP")
+    fig_up = px.line(
+        fig_up_data, x="DATE", y="Beta_Spot_UP", color="TenorLegend",
+        category_orders={"TenorLegend": sorted_legs_up},
+        labels={"Beta_Spot_UP": "Beta Spot UP (Vol pts / 1% Spot Move)"}
+    )
+    fig_up.update_traces(line=line_style)
+    connect_gaps_traces(fig_up)
+    fig_up.update_layout(legend_title_text="")
+    fig_up.update_layout(xaxis_title="Date")
+
+    fig_up_title = f"{pair} - {window} days Beta Spot Up (only using spot moves > {spot_return_threshold*100:.2f}%)"
+    update_fig_title(fig_up, fig_up_title)
+    fig_up.add_shape(type="line", x0=beta_up_df["DATE"].min(), x1=beta_up_df["DATE"].max(),
+                     y0=0, y1=0, line=dict(color="red", width=2))
+    fig_up.show(config=plotly_config)
+
+    # Graph Beta Spot DOWN
+    fig_down_data, sorted_legs_down = build_legend_info(df_down, "Tenor", "Beta_Spot_DOWN")
+    fig_down = px.line(
+        fig_down_data, x="DATE", y="Beta_Spot_DOWN", color="TenorLegend",
+        category_orders={"TenorLegend": sorted_legs_down},
+        labels={"Beta_Spot_DOWN": "Beta Spot Down (Vol pts / 1% Spot Move)"}
+    )
+    fig_down.update_traces(line=line_style)
+    connect_gaps_traces(fig_down)
+    fig_down.update_layout(legend_title_text="")
+    fig_down.update_layout(xaxis_title="Date")
+
+    fig_down_title = f"{pair} - {window} days Beta Spot Down (only using spot moves < -{spot_return_threshold*100:.2f}%)"
+    update_fig_title(fig_down, fig_down_title)
+    fig_down.add_shape(type="line", x0=beta_down_df["DATE"].min(), x1=beta_down_df["DATE"].max(),
+                       y0=0, y1=0, line=dict(color="red", width=2))
+    fig_down.show(config=plotly_config)
+
+def plot_realized_vol():
+    spot = df_raw[df_raw["Category"]=="Spot"].copy()
+    spot["DATE"] = pd.to_datetime(spot["DATE"])
+    spot.sort_values("DATE", inplace=True)
+    spot["Return"] = safe_log_ratio(spot["Value"])
+
+    spot.set_index("DATE", inplace=True)
+    realized_vol_df = pd.DataFrame(index=spot.index)
+
+    for w in realized_windows:
+        realized_vol_df[f"RV_{w}d"] = spot["Return"].rolling(w, min_periods=w).std() * np.sqrt(260)
+
+    realized_vol_df.reset_index(inplace=True)
+    rv_melt = realized_vol_df.melt(id_vars="DATE", var_name="Window", value_name="RealizedVol")
+
+    fig = px.line(rv_melt, x="DATE", y="RealizedVol", color="Window",
+                  title=f"{pair} - Realized Volatility (Daily)")
+    fig.update_traces(line=line_style)
+    connect_gaps_traces(fig)
+    update_fig_title(fig, f"{pair} - Realized Volatility (Daily)")
+
+    fig.update_layout(
+        xaxis_title="Date",
+        xaxis=dict(type="date"),
+        yaxis_tickformat=".2%",
+        width=900,
+        height=500
+    )
+
+    for d in fig.data:
+        col_name = d.name.split("=")[1] if "Window=" in d.name else d.name
+        last_val = realized_vol_df[col_name].iloc[-1]
+        d.name = f"{col_name} {last_val:.2%}"
+    fig.update_layout(legend_title_text="")
+    fig.show(config=plotly_config)
+
+def plot_calendar_zscore():
+    global df_calendar_info
+    atm_reset = df_raw[df_raw["Category"]=="ATM_vol"].copy().reset_index(drop=True)
+    atm_reset.sort_values("DATE", inplace=True)
+    atm_pivot = atm_reset.pivot(index="DATE", columns="Tenor", values="Value")
+    sorted_tenors = sorted(atm_pivot.columns, key=lambda x: tenor_to_float(x))
+    atm_pivot = atm_pivot[sorted_tenors]
+
+    my_scale = [
+        [0.0,  "#0000FF"],  # Blue
+        [0.25, "#8A2BE2"],  # Blue Violet
+        [0.5,  "#FFFFFF"],  # Pink (Hot Pink)
+        [0.75, "#FF4500"],  # Orange Red
+        [1.0,  "#FF0000"]   # Red
+    ]
+    window = rolling_windows[0]
+    atm_recent = atm_pivot.iloc[-window:]
+    n = len(sorted_tenors)
+    z_matrix = np.full((n, n), np.nan)
+    reversion_times = {}
+    rows_list = {}
+    pair_details = {}
+
+    for i in range(n):
+        for j in range(i+1, n):
+            if stop_flag:
+                return
+
+            vol_short = atm_pivot.iloc[-1, i]
+            vol_long  = atm_pivot.iloc[-1, j]
+
+            spread_series = atm_recent.iloc[:, j] - atm_recent.iloc[:, i]
+            mean_spread = spread_series.mean()
+            std_spread  = spread_series.std()
+
+            current_spread = vol_long - vol_short
+            z_sc = 0.0 if std_spread == 0 else (current_spread - mean_spread) / std_spread
+
+            z_matrix[i, j] = z_sc
+            half_life = compute_AR1_half_life(spread_series)
+
+            reversion_times[(sorted_tenors[i], sorted_tenors[j])] = half_life
+            pair_details[(sorted_tenors[i], sorted_tenors[j])] = (
+                z_sc, current_spread, mean_spread, vol_short, vol_long
+            )
+
+            row_dict = {
+                "TenorShort": sorted_tenors[i],
+                "TenorLong": sorted_tenors[j],
+                "Spread": current_spread,
+                "MeanSpread": mean_spread,
+                "Zscore": z_sc,
+                "AR1_HalfLifeDays": half_life
+            }
+            rows_list[(sorted_tenors[i], sorted_tenors[j])] = row_dict
+
+    df_calendar_info = pd.DataFrame(rows_list.values())
+
+    fig = px.imshow(
+        z_matrix, x=sorted_tenors, y=sorted_tenors, origin="lower",
+        color_continuous_scale=my_scale, range_color=(-3, 3),
+        labels=dict(color="Z-Score")
+    )
+    fig.update_layout(width=900, height=500, xaxis_title="Longer Tenor", yaxis_title="Shorter Tenor")
+    update_fig_title(fig, f"{pair} - ATM Calendar Spreads Z-Score Matrix (Window={window} days)")
+
+    annotations = []
+    for i in range(n):
+        for j in range(i+1, n):
+            val = z_matrix[i, j]
+            if np.isnan(val):
+                continue
+            txt = f"{val:.2f}"
+            color = "white" if val < 0 else "blue"
+            annotations.append(dict(
+                x=sorted_tenors[j], y=sorted_tenors[i], text=txt,
+                showarrow=False, font=dict(color=color, size=12),
+                xref="x", yref="y", xanchor="center", yanchor="middle"
+            ))
+    fig.update_layout(annotations=annotations)
+    fig.show(config=plotly_config)
+
+    # Build trade suggestions with vol levels
+    sorted_pairs = sorted(pair_details.items(), key=lambda x: abs(x[1][0]), reverse=True)
+    top5 = sorted_pairs[:5]
+    print(f"Trade Suggestions (Window = {window} days):")
+    for (t_short, t_long), (z, spread_val, mean_spread, vol_short, vol_long) in top5:
+        suggestion = "No action"
+        if z > 0:
+            suggestion = f"Sell {t_long} ATM at {vol_long:.2f}, Buy {t_short} ATM at {vol_short:.2f}"
+        elif z < 0:
+            suggestion = f"Buy {t_long} ATM at {vol_long:.2f}, Sell {t_short} ATM at {vol_short:.2f}"
+        hl = reversion_times.get((t_short, t_long), np.nan)
+        hl_txt = f"{hl:.1f} days" if pd.notna(hl) else "N/A"
+
+        print(f"Spread {t_short} vs {t_long}: z={z:.2f}, "
+              f"Spot={spread_val:.2f}, Mean={mean_spread:.2f} -> "
+              f"{suggestion} (half-life): {hl_txt}.")
+    print()
+
+def stationarity_zscore():
+    window = rolling_windows[0]
+    spot = df_raw[df_raw["Category"]=="Spot"].copy()
+    spot["Return"] = safe_log_ratio(spot["Value"])
+    spot.set_index("DATE", inplace=True)
+
+    atm = df_raw[df_raw["Category"]=="ATM_vol"].copy()
+    atm.set_index("DATE", inplace=True)
+
+    z_df = pd.DataFrame(index=spot.index)
+    for tenor in atm["Tenor"].unique():
+        sub = atm[atm["Tenor"]==tenor].copy()
+        mean_val = sub["Value"].rolling(window, min_periods=window).mean()
+        std_val  = sub["Value"].rolling(window, min_periods=window).std()
+        z_df[tenor] = (sub["Value"] - mean_val) / std_val
+
+    z_df["MeanZScore"] = z_df.mean(axis=1, skipna=True)
+    mean_z_series = z_df["MeanZScore"].dropna()
+    if len(mean_z_series) < 30:
+        print("Not enough data points for an ADF test on MeanZScore.")
+        return
+
+    print("[Stationarity test on MeanZScore over the entire period]")
+    adf_res = adfuller(mean_z_series, autolag='AIC')
+    stat_adf = adf_res[0]
+    p_value = adf_res[1]
+    crit_values = adf_res[4]
+
+    print(f"ADF Statistic: {stat_adf:.4f}, p-value: {p_value:.4f}")
+    for k, v in crit_values.items():
+        print(f"   Crit {k}: {v:.4f}")
+
+    if p_value < 0.05:
+        print("Conclusion: MeanZScore appears to be stationary (p<0.05).")
+    else:
+        print("Conclusion: MeanZScore is not stationary at the 5% level.")
+
+    hl = compute_AR1_half_life(mean_z_series)
+    hl_txt = f"{hl:.1f} days" if pd.notna(hl) else "N/A"
+    print(f"(half-life): {hl_txt}.")
+    print()
+
+def create_summary_table():
+    global df_raw, df_corr_final, df_volvol_final, df_beta_final, df_zscore_final, df_beta_up_down
+    df_base = df_raw[["DATE", "Category", "Tenor", "Value"]].copy()
+    df_corr2 = df_corr_final.rename(columns={"Corr": "CorrWithSpot"})
+    df_volvol2 = df_volvol_final.copy()
+    df_beta2 = df_beta_final.copy()
+    df_zscore2 = df_zscore_final.copy()
+    df_betaud = df_beta_up_down.copy()
+
+    df_base = ensure_columns(df_base, ["DATE", "Tenor"])
+    df_corr2 = ensure_columns(df_corr2, ["DATE", "Tenor", "CorrWithSpot"])
+    df_volvol2 = ensure_columns(df_volvol2, ["DATE", "Tenor", "VolOfVol"])
+    df_beta2 = ensure_columns(df_beta2, ["DATE", "Tenor", "Beta"])
+    df_zscore2 = ensure_columns(df_zscore2, ["DATE", "Tenor", "ZScore"])
+    df_betaud = ensure_columns(df_betaud, ["DATE", "Tenor", "Beta_Spot_UP", "Beta_Spot_DOWN"])
+
+    df_merged = pd.merge(df_base, df_corr2, on=["DATE", "Tenor"], how="outer")
+    df_merged = pd.merge(df_merged, df_volvol2, on=["DATE", "Tenor"], how="outer")
+    df_merged = pd.merge(df_merged, df_beta2, on=["DATE", "Tenor"], how="outer")
+    df_merged = pd.merge(df_merged, df_zscore2, on=["DATE", "Tenor"], how="outer")
+    df_merged = pd.merge(df_merged, df_betaud, on=["DATE", "Tenor"], how="outer")
+    df_merged.sort_values(["DATE", "Tenor"], inplace=True)
+    df_merged["Return"] = np.nan
+    for tnr in df_merged["Tenor"].dropna().unique():
+        mask = (df_merged["Tenor"] == tnr)
+        df_merged.loc[mask, "Return"] = np.log(df_merged.loc[mask, "Value"] / df_merged.loc[mask, "Value"].shift(1))
+    df_summary = df_merged
+    print("\n[Summary DataFrame creation completed]")
+    print("df_summary columns:", df_summary.columns.tolist())
+    print(df_summary.head(10))
+    return df_summary
+
+
+# =============================================================================
+# [RUN SCRIPT] Main function
+# =============================================================================
+def run_script(b):
+    global stop_flag
+    if stop_flag:
+        return
+
+    with output_area:
+        clear_output()
+        print("Starting the script...")
+        progress_bar.value = 0
+        stop_button.disabled = False
+
+        # --- Update global variables from widgets ---
+        global pair, tenors, start_date, end_date, rolling_windows, realized_windows, spot_return_threshold
+        pair = pair_widget.value.strip()
+        _tenors = [t.strip() for t in tenors_widget.value.split(",") if t.strip() != ""]
+        tenors = _tenors
+        start_date = start_date_widget.value if start_date_widget.value else datetime(2023, 1, 1)
+        end_date = end_date_widget.value if end_date_widget.value else datetime.today()
+        rolling_windows = [rolling_window_widget.value]
+        _rw = [int(x) for x in realized_windows_widget.value.split(",") if x.strip().isdigit()]
+        realized_windows = _rw if _rw else [5,10,30,90]
+        spot_return_threshold = spot_return_threshold_widget.value
+
+        # Also update these templates so they reflect the chosen threshold
+        global title_beta_up_template, title_beta_down_template
+        window_placeholder = "{window}"
+        title_beta_up_template   = f"{pair} - {window_placeholder} days Beta Spot Up (only using spot moves > {spot_return_threshold*100:.2f}%)"
+        title_beta_down_template = f"{pair} - {window_placeholder} days Beta Spot Down (only using spot moves < {-spot_return_threshold*100:.2f}%)"
+
+        # Update other titles so they reflect the new pair
+        global title_spot, title_atm_vol, title_25d_rr, title_25d_bf, title_10d_rr, title_10d_bf
+        title_spot            = f"{pair} - Spot"
+        title_atm_vol         = f"{pair} - ATM Vol"
+        title_25d_rr          = f"{pair} - 25D Risk Reversal"
+        title_25d_bf          = f"{pair} - 25D Butterfly"
+        title_10d_rr          = f"{pair} - 10D Risk Reversal"
+        title_10d_bf          = f"{pair} - 10D Butterfly"
+
+        # --- BQL data retrieval ---
+        print("Retrieving BQL data...")
+        bq_svc = bql.Service()
+        tickers = [f"{pair} BGN Curncy"]
+        for t in tenors:
+            tickers.append(f"{pair}{'12M' if t=='1Y' else t} BGN Curncy")
+            tickers.append(f"{pair}V{'1Y' if t=='1Y' else t} BGN Curncy")
+            tickers.append(f"{pair}25R{'1Y' if t=='1Y' else t} BGN Curncy")
+            tickers.append(f"{pair}25B{'1Y' if t=='1Y' else t} BGN Curncy")
+            tickers.append(f"{pair}10R{'1Y' if t=='1Y' else t} BGN Curncy")
+            tickers.append(f"{pair}10B{'1Y' if t=='1Y' else t} BGN Curncy")
+
+        px_item = bq_svc.data.px_last(dates=bq_svc.func.range(start_date, end_date))
+        req = bql.Request(tickers, px_item)
+        resp = bq_svc.execute(req)
+        _df = resp[0].df().reset_index()
+        px_col = [c for c in _df.columns if "PX_LAST" in c.upper()]
+        if not px_col:
+            print("No PX_LAST column found, stopping script.")
+            return
+        _df.rename(columns={px_col[0]: "Value"}, inplace=True)
+        _df["Category"] = _df["ID"].apply(detect_category)
+        _df["Tenor"] = _df["ID"].apply(extract_tenor)
+        _df["DATE"] = pd.to_datetime(_df["DATE"])
+        mask = (_df["DATE"] >= pd.to_datetime(start_date)) & (_df["DATE"] <= pd.to_datetime(end_date))
+        _df = _df[mask]
+        _df = _df[_df["DATE"].dt.dayofweek < 5]
+        # Sort the DataFrame by 'Category', 'Tenor', and 'DATE'
+        _df.sort_values(["Category", "DATE"], inplace=True)
+
+        # Separate the DataFrame into 'Spot' and other categories
+        spot_df = _df[_df["Category"] == "Spot"].copy()
+        other_df = _df[_df["Category"] != "Spot"].copy()
+
+        # Forward fill for 'Spot' category
+        spot_df.loc[:, 'Value'] = spot_df['Value'].fillna(method='ffill')
+
+        # Forward fill for other categories, grouped by 'Category' and 'Tenor'
+        other_df.loc[:, 'Value'] = other_df.groupby(['Category', 'Tenor'])['Value'].fillna(method='ffill')
+
+        # Concatenate the results back together
+        _df = pd.concat([spot_df, other_df], ignore_index=True)
+
+        global df_raw
+        df_raw = _df
+
+        print("Data retrieved. Number of rows:", len(df_raw))
+
+        # Progress
+        progress_bar.value = 20
+
+        if stop_flag:
+            return
+
+        # 1) Spot
+        if check_spot.value:
+            print("Plotting Spot...")
+            plot_spot()
+
+        if stop_flag:
+            return
+
+        # 2) Realized Vol
+        if check_realized_vol.value:
+            print("Plotting Realized Vol...")
+            plot_realized_vol()
+
+        if stop_flag:
+            return
+
+        # 3) ATM + 25D/10D RR/BF
+        if any([check_atm.value, check_25d_rr.value, check_25d_bf.value, check_10d_rr.value, check_10d_bf.value]):
+            print("Plotting basic categories (ATM, RR, BF)...")
+            plot_basic_categories()
+
+        if stop_flag:
+            return
+
+        # 4) Correlation
+        if check_correlation.value:
+            print("Plotting Correlation (Spot/ATM)...")
+            plot_correlation()
+
+        if stop_flag:
+            return
+        
+        # New correlation plot
+        if check_vol_forward_corr.value:
+            print("Plotting Correlation (Vol/Forward)...")
+            plot_vol_forward_correlation()
+            
+        if stop_flag:
+            return       
+
+        # 5) Vol of Vol
+        if check_vol_of_vol.value:
+            print("Plotting Vol of Vol...")
+            plot_vol_of_vol()
+
+        if stop_flag:
+            return
+
+        # 6) Z-Score
+        if check_zscore.value:
+            print("Plotting Z-Score (ATM)...")
+            plot_zscore()
+
+        if stop_flag:
+            return
+
+        # 7) Mean Z-Score
+        if check_mean_zscore.value:
+            print("Plotting Mean Z-Score (ATM)...")
+            plot_mean_zscore()
+
+        if stop_flag:
+            return
+
+        # 8) Beta
+        if check_beta.value:
+            print("Plotting Beta (Vol vs Spot)...")
+            plot_beta()
+
+        if stop_flag:
+            return
+
+        # 9) Beta Spot Up/Down
+        if check_beta_up_down.value:
+            print("Plotting Beta Spot Up/Down...")
+            plot_beta_spot()
+
+        if stop_flag:
+            return
+
+        # 10) Calendar
+        if check_calendar.value:
+            print("Plotting Calendar Z-Score...")
+            plot_calendar_zscore()
+
+        if stop_flag:
+            return
+
+        # 11) Stationarity
+        if check_stationarity.value:
+            print("Testing Stationarity of Mean Z-Score (ATM)...")
+            stationarity_zscore()
+
+        progress_bar.value = 70
+
+        # 12) Creation of the summary DataFrame
+        #print("Creating the summary DataFrame...")
+        #df_summary = create_summary_table()
+
+        progress_bar.value = 100
+        print("Script completed.")
+
+        stop_button.disabled = True
+        stop_flag = False
+run_button.on_click(run_script)
