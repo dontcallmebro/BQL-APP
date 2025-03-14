@@ -1,0 +1,603 @@
+import bql
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import re
+from datetime import datetime
+import math
+from math import log, sqrt
+from scipy.stats import norm
+from scipy.optimize import minimize, brentq
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+# =============================================================================
+# Graph Appearance (Black background, line style, etc.)
+# =============================================================================
+line_style = dict(width=1.3, dash='solid')
+layout_conf = dict(
+    template="plotly_dark",
+    autosize=False,
+    width=900,
+    height=500,
+    plot_bgcolor="rgba(55,55,55,1)",  # pure black background
+    paper_bgcolor="rgba(55,55,55,1)",  # pure black background
+    margin=dict(l=60, r=80, t=80, b=60),
+    dragmode='pan',
+    xaxis=dict(
+        gridcolor="rgba(255,255,255,0.3)",
+        gridwidth=0.5,
+        tickfont=dict(size=14)
+    ),
+    yaxis=dict(
+        gridcolor="rgba(255,255,255,0.3)",
+        gridwidth=0.5,
+        tickfont=dict(size=14)
+    ),
+    legend=dict(
+        orientation='v', x=1.02, y=0.5, xanchor='left', yanchor='middle',
+        bgcolor='rgba(15,15,15,0.6)',
+        bordercolor='rgba(200,200,200,0.4)',
+        borderwidth=1,
+        font=dict(color='white', size=12),
+        itemsizing='constant',
+        tracegroupgap=10
+    ),
+)
+plotly_config = dict(scrollZoom=True)
+
+# =============================================================================
+# Widgets for the interface
+# =============================================================================
+pair_widget = widgets.Text(
+    value="EURUSD",
+    description="Pair:"
+)
+
+tenors_widget = widgets.Text(
+    value="1M,2M,3M,6M,9M,1Y",
+    description="Tenors:"
+)
+
+start_date_widget = widgets.DatePicker(
+    value=datetime(2024, 6, 1),
+    description="Start:"
+)
+
+end_date_widget = widgets.DatePicker(
+    value=datetime.today(),
+    description="End:"
+)
+
+beta_widget = widgets.FloatText(
+    value=1.0,
+    description="Beta:"
+)
+
+smile_tenor_widget = widgets.Text(
+    value="3M",
+    description="Smile:"
+)
+
+run_button = widgets.Button(
+    description="Run",
+    button_style='success'
+)
+stop_button = widgets.Button(
+    description="Stop",
+    button_style='danger',
+    disabled=True
+)
+
+progress_bar = widgets.IntProgress(
+    value=0,
+    min=0,
+    max=100,
+    description="Progress:"
+)
+
+ui = widgets.VBox([
+    pair_widget,
+    tenors_widget,
+    start_date_widget,
+    end_date_widget,
+    beta_widget,
+    smile_tenor_widget,
+    widgets.HBox([run_button, stop_button]),
+    progress_bar
+])
+output_area = widgets.Output()
+
+display(ui)
+display(output_area)
+
+stop_flag = False
+
+def on_stop_button_clicked(b):
+    global stop_flag
+    stop_flag = True
+    with output_area:
+        print("[Stop requested]")
+
+stop_button.on_click(on_stop_button_clicked)
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+def detect_cat(ticker: str):
+    """Classify the Bloomberg ticker as ATM, RR, BF, or 'Other' (Forward/Spot)."""
+    up = ticker.upper()
+    if "V" in up:
+        return "ATM_vol"
+    elif "25R" in up or "10R" in up:
+        return "RR"
+    elif "25B" in up or "10B" in up:
+        return "BF"
+    return "Other"  # Forward or Spot
+
+def extract_tenor(ticker: str):
+    """
+    Extract something like '1M', '12M', etc. from the ticker.
+    We won't do the final 12M->1Y replacement here,
+    because we'll do that globally with df_raw['Tenor'].replace().
+    """
+    up = ticker.upper()
+    m = re.search(r"(\d+[WMY])", up)
+    if m:
+        return m.group(1)
+    return np.nan
+
+def safe_merge(left, right, on=["DATE", "Tenor"]):
+    return left.merge(right, on=on, how="outer")
+
+def call_put(atm, rr, bf):
+    """Compute 10D/25D Call/Put from ATM, RR, BF."""
+    if pd.isna(atm) or pd.isna(rr) or pd.isna(bf):
+        return np.nan, np.nan
+    call_vol = atm + 0.5*rr + bf
+    put_vol  = atm - 0.5*rr + bf
+    return call_vol, put_vol
+
+def delta_to_strike(delta_abs, vol, T, forward=1.0, cp=1):
+    """Convert a given delta to strike using Black LN formula."""
+    def f_eq(k_):
+        if k_ <= 1e-12:
+            return 999999
+        d1 = (math.log(forward/k_) + 0.5*(vol**2)*T) / (vol*math.sqrt(T))
+        cdf_val = norm.cdf(d1)
+        if cp>0:
+            return cdf_val - delta_abs
+        else:
+            return (cdf_val - 1.0) + delta_abs
+    try:
+        sol = brentq(f_eq, 1e-8, 10.0, maxiter=200)
+    except:
+        sol = np.nan
+    return sol
+
+def sabr_ln_vol(F, K, T, alpha, rho, nu, beta):
+    """Hagan's Lognormal SABR formula."""
+    eps = 1e-14
+    if F < eps or K < eps or T < eps:
+        return alpha
+    if abs(F - K) < eps:
+        return alpha / (F**(1-beta))
+    logFK = math.log(F/K)
+    FK_term = (F*K)**((1-beta)/2.0)
+    z = (nu/alpha)*FK_term*logFK
+    denom_factor = 1 + ((1-beta)**2/24.0)*logFK**2 + ((1-beta)**4/1920.0)*logFK**4
+    x_z = math.log((math.sqrt(1 - 2*rho*z + z*z) + z - rho)/(1-rho))
+    if abs(x_z) < eps:
+        return alpha/(F**(1-beta))
+    vol_approx = (alpha/(FK_term*denom_factor))*(z/x_z)
+    if vol_approx <= 0:
+        vol_approx = alpha/(F**(1-beta))
+    return vol_approx
+
+def sabr_calib_rho_nu(F, Klist, Vlist, T, alpha, beta, x0=None):
+    """Calibrate (rho, nu) given 5 market points under SABR."""
+    def objective(par):
+        rho_, nu_ = par
+        sse = 0.0
+        for (k_, v_) in zip(Klist, Vlist):
+            model_vol = sabr_ln_vol(F, k_, T, alpha, rho_, nu_, beta)
+            sse += (model_vol - v_)**2
+        return sse
+
+    bnds = [(-0.999, 0.999), (1e-8, 3.0)]
+    if x0 is None:
+        x0 = [0.0, 0.5]
+    res = minimize(objective, x0, bounds=bnds, method="L-BFGS-B")
+    if not res.success:
+        return (np.nan, np.nan)
+    return (res.x[0], res.x[1])
+
+# =============================================================================
+# Main function run_script
+# =============================================================================
+def run_script(b):
+    global stop_flag
+    if stop_flag:
+        return
+    stop_button.disabled = False
+    with output_area:
+        clear_output()
+        print("[INFO] Starting script...")
+        progress_bar.value = 0
+
+        # 1) Retrieve user inputs
+        pair_str = pair_widget.value.strip()
+        tenor_input_str = tenors_widget.value.strip()
+        start_val = start_date_widget.value if start_date_widget.value else datetime(2023,1,1)
+        end_val   = end_date_widget.value   if end_date_widget.value   else datetime.today()
+        user_tenors = [x.strip() for x in tenor_input_str.split(",") if x.strip()]
+        if not user_tenors:
+            print("No tenors provided, stopping.")
+            return
+        beta_val = beta_widget.value
+        smile_tenor = smile_tenor_widget.value.strip()
+
+        print("[PARAMS]")
+        print("   Pair       =", pair_str)
+        print("   Tenors     =", user_tenors)
+        print("   Start Date =", start_val)
+        print("   End Date   =", end_val)
+        print("   Beta       =", beta_val)
+        print("   Smile      =", smile_tenor)
+
+        progress_bar.value = 5
+
+        # 2) BQL Data Extraction
+        bq_svc = bql.Service()
+        tickers = [f"{pair_str} BGN Curncy"]  # Spot
+        for t_ in user_tenors:
+            # Add forward, ATM, 25R, 25B, 10R, 10B
+            tickers.append(f"{pair_str}{'12M' if t_=='1Y' else t_} BGN Curncy")
+            tickers.append(f"{pair_str}V{'1Y' if t_=='1Y' else t_} BGN Curncy")
+            tickers.append(f"{pair_str}25R{'1Y' if t_=='1Y' else t_} BGN Curncy")
+            tickers.append(f"{pair_str}25B{'1Y' if t_=='1Y' else t_} BGN Curncy")
+            tickers.append(f"{pair_str}10R{'1Y' if t_=='1Y' else t_} BGN Curncy")
+            tickers.append(f"{pair_str}10B{'1Y' if t_=='1Y' else t_} BGN Curncy")
+
+        px_item = bq_svc.data.px_last(dates=bq_svc.func.range(start_val, end_val))
+        req = bql.Request(tickers, px_item)
+        resp = bq_svc.execute(req)
+
+        df_raw = resp[0].df().reset_index()
+        px_cols = [c for c in df_raw.columns if "PX_LAST" in c.upper()]
+        if not px_cols:
+            print("No PX_LAST column found. Exiting.")
+            return
+        df_raw.rename(columns={px_cols[0]: "Value"}, inplace=True)
+
+        df_raw["Category"] = df_raw["ID"].apply(detect_cat)
+        df_raw["Tenor"]    = df_raw["ID"].apply(extract_tenor)
+        df_raw["DATE"]     = pd.to_datetime(df_raw["DATE"])
+
+        # Now unify "12M" => "1Y" for consistency
+        df_raw["Tenor"] = df_raw["Tenor"].replace({"12M": "1Y"})
+
+        # Filter by date range, business days
+        df_raw = df_raw[df_raw["DATE"].dt.dayofweek < 5]
+        df_raw = df_raw[df_raw["DATE"] >= pd.to_datetime(start_val)]
+        df_raw = df_raw[df_raw["DATE"] <= pd.to_datetime(end_val)]
+        df_raw.sort_values(["DATE", "Tenor"], inplace=True)
+
+        progress_bar.value = 15
+        if stop_flag:
+            return
+
+        # 3) Merge data into df_merge
+        atm_df = df_raw[df_raw["Category"]=="ATM_vol"][["DATE","Tenor","Value"]].copy()
+        atm_df.rename(columns={"Value":"ATM"}, inplace=True)
+
+        rr25_df = df_raw[(df_raw["Category"]=="RR") & (df_raw["ID"].str.contains("25R"))][["DATE","Tenor","Value"]].copy()
+        rr25_df.rename(columns={"Value":"RR25"}, inplace=True)
+
+        bf25_df = df_raw[(df_raw["Category"]=="BF") & (df_raw["ID"].str.contains("25B"))][["DATE","Tenor","Value"]].copy()
+        bf25_df.rename(columns={"Value":"BF25"}, inplace=True)
+
+        rr10_df = df_raw[(df_raw["Category"]=="RR") & (df_raw["ID"].str.contains("10R"))][["DATE","Tenor","Value"]].copy()
+        rr10_df.rename(columns={"Value":"RR10"}, inplace=True)
+
+        bf10_df = df_raw[(df_raw["Category"]=="BF") & (df_raw["ID"].str.contains("10B"))][["DATE","Tenor","Value"]].copy()
+        bf10_df.rename(columns={"Value":"BF10"}, inplace=True)
+
+        # Forwards (Spot is excluded)
+        all_other = df_raw[df_raw["Category"]=="Other"].copy()
+        spot_mask = all_other["ID"].str.upper().eq(f"{pair_str} BGN CURNCY")
+        fwd_df = all_other[~spot_mask][["DATE","Tenor","Value"]].copy()
+        fwd_df.rename(columns={"Value":"Forward"}, inplace=True)
+
+        df_merge = atm_df
+        for subdf in [rr25_df, bf25_df, rr10_df, bf10_df, fwd_df]:
+            df_merge = safe_merge(df_merge, subdf)
+        df_merge.sort_values(["DATE", "Tenor"], inplace=True)
+
+        # Compute 10D/25D call/put
+        df_merge["Call25"] = np.nan
+        df_merge["Put25"]  = np.nan
+        df_merge["Call10"] = np.nan
+        df_merge["Put10"]  = np.nan
+
+        for idx in df_merge.index:
+            atm_  = df_merge.at[idx,"ATM"]
+            rr25_ = df_merge.at[idx,"RR25"]
+            bf25_ = df_merge.at[idx,"BF25"]
+            rr10_ = df_merge.at[idx,"RR10"]
+            bf10_ = df_merge.at[idx,"BF10"]
+            c25, p25 = call_put(atm_, rr25_, bf25_)
+            c10, p10 = call_put(atm_, rr10_, bf10_)
+            df_merge.at[idx, "Call25"] = c25
+            df_merge.at[idx, "Put25"]  = p25
+            df_merge.at[idx, "Call10"] = c10
+            df_merge.at[idx, "Put10"]  = p10
+
+        progress_bar.value = 30
+        if stop_flag:
+            return
+
+        # 4) Build df_final (all data in one place)
+        df_final_list = []
+        final_cols = [
+            "DATE","Tenor","Forward","ATM","RR25","BF25","RR10","BF10",
+            "Call25","Put25","Call10","Put10",
+            "KCall25","KPut25","KCall10","KPut10","KATM",
+            "SABR_Rho","SABR_Nu"
+        ]
+
+        # Tenor => fraction of year
+        tenor_map = {
+            "1W":7/365, "2W":14/365, "1M":1/12, "2M":2/12,
+            "3M":3/12, "6M":6/12, "9M":9/12, "1Y":1.0, "2Y":2.0
+        }
+        warm_start = {}
+
+        for idx in df_merge.index:
+            if stop_flag:
+                return
+            row_ = df_merge.loc[idx]
+            dt_  = row_["DATE"]
+            tn_  = row_["Tenor"]   # now "1Y" if it was "12M"
+
+            if pd.isna(tn_) or (tn_ not in tenor_map):
+                continue
+            T_ = tenor_map[tn_]
+
+            fwd_ = row_["Forward"]
+            atm_val = row_["ATM"]
+            c25v = row_["Call25"]
+            p25v = row_["Put25"]
+            c10v = row_["Call10"]
+            p10v = row_["Put10"]
+
+            # skip if missing
+            if pd.isna(fwd_) or any(pd.isna(x) for x in [atm_val,c25v,p25v,c10v,p10v]):
+                continue
+            if fwd_ <= 0:
+                continue
+
+            # Scale forward and strikes for numerical stability
+            scale_factor = 1.0
+            if fwd_ > 10:
+                scale_factor = 100.0
+            fwd_scaled = fwd_ / scale_factor
+
+            # alpha => match ATM
+            atm_dec = atm_val/100.0
+            alpha_  = atm_dec*(fwd_scaled**(1-beta_val))
+
+            c25d = c25v/100.0
+            p25d = p25v/100.0
+            c10d = c10v/100.0
+            p10d = p10v/100.0
+
+            if any(x<=0 for x in [alpha_, c25d,p25d,c10d,p10d]):
+                continue
+
+            # strike for ATM => fwd
+            KATM = fwd_scaled
+            KCall25 = delta_to_strike(0.25, alpha_, T_, forward=fwd_scaled, cp=+1)
+            KPut25  = delta_to_strike(0.25, alpha_, T_, forward=fwd_scaled, cp=-1)
+            KCall10 = delta_to_strike(0.10, alpha_, T_, forward=fwd_scaled, cp=+1)
+            KPut10  = delta_to_strike(0.10, alpha_, T_, forward=fwd_scaled, cp=-1)
+
+            Klist = [KCall10,KCall25,KATM,KPut25,KPut10]
+            Vlist = [c10d,c25d,atm_dec,p25d,p10d]
+
+            x0 = warm_start.get(tn_, [0.0,0.5])
+            rho_, nu_ = sabr_calib_rho_nu(fwd_scaled, Klist, Vlist, T_, alpha_, beta_val, x0=x0)
+            if not math.isnan(rho_) and not math.isnan(nu_):
+                warm_start[tn_] = [rho_, nu_]
+
+            # Rescale strikes back to original scale
+            KCall25 *= scale_factor
+            KPut25 *= scale_factor
+            KCall10 *= scale_factor
+            KPut10 *= scale_factor
+            KATM *= scale_factor
+
+            df_final_list.append({
+                "DATE": dt_,
+                "Tenor": tn_,
+                "Forward": fwd_,
+                "ATM": atm_val,
+                "RR25": row_.get("RR25", np.nan),
+                "BF25": row_.get("BF25", np.nan),
+                "RR10": row_.get("RR10", np.nan),
+                "BF10": row_.get("BF10", np.nan),
+                "Call25": c25v,
+                "Put25":  p25v,
+                "Call10": c10v,
+                "Put10":  p10v,
+                "KCall25": KCall25,
+                "KPut25":  KPut25,
+                "KCall10": KCall10,
+                "KPut10":  KPut10,
+                "KATM":    KATM,
+                "SABR_Rho": rho_*100 if not math.isnan(rho_) else np.nan,
+                "SABR_Nu":  nu_*100 if not math.isnan(nu_) else np.nan
+            })
+
+        df_final = pd.DataFrame(df_final_list, columns=final_cols)
+        df_final.sort_values(["DATE","Tenor"], inplace=True)
+        df_final.reset_index(drop=True, inplace=True)
+
+        progress_bar.value = 60
+        if df_final.empty:
+            print("[WARNING] df_final is empty => no data for these tenors/dates.")
+            stop_button.disabled = True
+            stop_flag = False
+            return
+
+        # =============================================================================
+        # Plot Rho & Nu
+        # =============================================================================
+        def plot_sabr_rho_nu(df_f):
+            if df_f.empty:
+                print("No data for Rho/Nu.")
+                return
+            tenor_order = ["1W","2W","1M","2M","3M","6M","9M","1Y","2Y"]
+            df_p = df_f.copy()
+            df_p["Tenor"] = pd.Categorical(df_p["Tenor"], categories=tenor_order, ordered=True)
+
+            # Rho
+            fig_rho = px.line(df_p, x="DATE", y="SABR_Rho", color="Tenor",
+                              category_orders={"Tenor": tenor_order})
+            for trace in fig_rho.data:
+                tenor_lbl = trace.name
+                sub_ = df_p[df_p["Tenor"] == tenor_lbl]
+                if not sub_.empty:
+                    last_val = sub_["SABR_Rho"].iloc[-1]
+                    trace.name = f"{tenor_lbl} ({last_val:.2f}%)"
+            fig_rho.update_traces(line=line_style)
+            fig_rho.add_hline(y=0, line_color="red", line_width=1)
+            fig_rho.update_layout(
+                title=dict(text=f"{pair_str} - SABR Rho(%) vs Time", x=0.5),
+                **layout_conf
+            )
+            fig_rho.show(config=plotly_config)
+
+            # Nu
+            fig_nu = px.line(df_p, x="DATE", y="SABR_Nu", color="Tenor",
+                             category_orders={"Tenor": tenor_order})
+            for trace in fig_nu.data:
+                tenor_lbl = trace.name
+                sub_ = df_p[df_p["Tenor"] == tenor_lbl]
+                if not sub_.empty:
+                    last_val = sub_["SABR_Nu"].iloc[-1]
+                    trace.name = f"{tenor_lbl} ({last_val:.2f}%)"
+            fig_nu.update_traces(line=line_style)
+            fig_nu.add_hline(y=0, line_color="red", line_width=1)
+            fig_nu.update_layout(
+                title=dict(text=f"{pair_str} - SABR Nu(%) vs Time", x=0.5),
+                **layout_conf
+            )
+            fig_nu.show(config=plotly_config)
+
+        plot_sabr_rho_nu(df_final)
+
+        if stop_flag:
+            return
+
+        progress_bar.value = 80
+        print(f"Plotting smile for tenor '{smile_tenor}' (latest date).")
+
+        def plot_smile_tenor(df_f, tenor_choice):
+            sub_ = df_f[df_f["Tenor"] == tenor_choice].copy()
+            if sub_.empty:
+                print(f"No data for tenor={tenor_choice}.")
+                return
+            latest_dt = sub_["DATE"].max()
+            row_ = sub_[sub_["DATE"] == latest_dt]
+            if row_.empty:
+                print("No final row found for that tenor.")
+                return
+            row_ = row_.iloc[0]
+
+            forward_ = row_["Forward"]
+            atm_dec  = row_["ATM"]/100.0
+            v10C = row_["Call10"]/100.0
+            v25C = row_["Call25"]/100.0
+            v10P = row_["Put10"]/100.0
+            v25P = row_["Put25"]/100.0
+
+            kC10 = row_["KCall10"]
+            kC25 = row_["KCall25"]
+            kP10 = row_["KPut10"]
+            kP25 = row_["KPut25"]
+            kATM = row_["KATM"]
+
+            # Market vols => 10P, 25P, ATM, 25C, 10C
+            market_vols = [v10P*100, v25P*100, atm_dec*100, v25C*100, v10C*100]
+            strikes = [kP10, kP25, kATM, kC25, kC10]
+
+            rho_ = row_["SABR_Rho"]/100.0
+            nu_  = row_["SABR_Nu"]/100.0
+
+            alpha_sabr = atm_dec * (forward_**(1-beta_val))
+
+            local_map = {
+                "1W":7/365, "2W":14/365, "1M":1/12, "2M":2/12,
+                "3M":3/12, "6M":6/12, "9M":9/12, "1Y":1.0, "2Y":2.0
+            }
+            T_ = local_map.get(tenor_choice,0.0)
+
+            sabr_vols = []
+            for k_ in strikes:
+                sabr_vol = sabr_ln_vol(forward_, k_, T_, alpha_sabr, rho_, nu_, beta_val)
+                sabr_vols.append(sabr_vol * 100)
+
+            try:
+                x_dense = np.linspace(min(strikes), max(strikes), 200)
+                from scipy.interpolate import interp1d
+                market_interp = interp1d(strikes, market_vols, kind='cubic', fill_value="extrapolate")
+                sabr_interp   = interp1d(strikes, sabr_vols,   kind='cubic', fill_value="extrapolate")
+                market_smooth = market_interp(x_dense)
+                sabr_smooth   = sabr_interp(x_dense)
+            except:
+                print("Interpolation failed, using raw data only.")
+                x_dense = strikes
+                market_smooth = market_vols
+                sabr_smooth   = sabr_vols
+
+            fig_smile = go.Figure()
+            fig_smile.add_trace(go.Scatter(
+                x=strikes, y=market_vols,
+                mode="markers",
+                name="Market Smile (pts)"
+            ))
+            fig_smile.add_trace(go.Scatter(
+                x=x_dense, y=market_smooth,
+                mode="lines",
+                name="Market Smile (smooth)",
+                line=line_style
+            ))
+            fig_smile.add_trace(go.Scatter(
+                x=strikes, y=sabr_vols,
+                mode="markers",
+                name="SABR (pts)"
+            ))
+            fig_smile.add_trace(go.Scatter(
+                x=x_dense, y=sabr_smooth,
+                mode="lines",
+                name="SABR (smooth)",
+                line=line_style
+            ))
+            fig_smile.update_layout(
+                title=dict(text=f"{pair_str} - Market vs SABR Smile - {tenor_choice} @ {latest_dt.date()}", x=0.5),
+                xaxis_title="Strike",
+                yaxis_title="Vol (%)",
+                **layout_conf
+            )
+            fig_smile.show(config=plotly_config)
+
+        plot_smile_tenor(df_final, smile_tenor)
+
+        progress_bar.value = 100
+        print("[INFO] Done.")
+        stop_button.disabled = True
+        stop_flag = False
+
+run_button.on_click(run_script)
