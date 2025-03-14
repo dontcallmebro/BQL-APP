@@ -1,0 +1,542 @@
+import bql
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import re
+from datetime import datetime
+import statsmodels.api as sm
+from tabulate import tabulate
+from rich.console import Console
+from rich.table import Table
+import warnings
+
+# Suppress FutureWarning messages
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+print(f"\n[OK] Spread Analysis running...")
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+pair = "USDCHF"
+tenors = ["1M", "2M","3M", "6M","9M", "1Y"]
+start_date = "2023-06-01"
+end_date = datetime.today()
+rolling_window = 60
+
+# We want 10 suggestions (top 10)
+TOP_N = 15
+
+# Deltas: the new format
+delta_map = {
+    "Call10": "10D Call",
+    "Call25": "25D Call",
+    "ATM": "ATM",
+    "Put25": "25D Put",
+    "Put10": "10D Put"
+}
+# Internal order (for sorting)
+delta_order = ["Call10", "Call25", "ATM", "Put25", "Put10"]
+
+# Color scale (for heatmaps)
+my_scale = [
+    [0.00, "#FF0000"],  # Lavender
+    [0.25, "#D8BFD8"],  # Thistle
+    [0.50, "#A9A9F5"],  # Light Slate Blue
+    [0.75, "#87CEFA"],  # Royal Blue
+    [1.00, "#4169E1"]   # Royal Blue (same as above for consistency)
+]
+
+# =============================================================================
+# STYLE PLOTLY
+# =============================================================================
+layout_conf = dict(
+    template="plotly_dark",
+    width=1400,
+    height=1400,
+    #plot_bgcolor="rgba(55,55,55,1)",
+    #paper_bgcolor="rgba(55,55,55,1)",
+    margin=dict(l=60, r=80, t=80, b=60),
+    dragmode='pan',
+    xaxis=dict(gridcolor="rgba(55,55,55,1)", gridwidth=0.5, tickfont=dict(size=14)),
+    yaxis=dict(gridcolor="rgba(55,55,55,1)", gridwidth=0.5, tickfont=dict(size=14)),
+    legend=dict(
+        orientation='v', x=1.02, y=0.5, xanchor='left', yanchor='middle',
+        bgcolor='rgba(15,15,15,0.6)', bordercolor='rgba(200,200,200,0.4)', borderwidth=1,
+        font=dict(color='white', size=12), itemsizing='constant', tracegroupgap=10
+    ),
+)
+
+def update_fig_title(fig, title_text):
+    fig.update_layout(
+        title=dict(text=title_text, x=0.5, xanchor='center',
+                   font=dict(size=18, color="white", family="Arial Black"))
+    )
+    fig.update_layout(**layout_conf)
+
+# =============================================================================
+# 1) DATA EXTRACTION
+# =============================================================================
+bq_svc = bql.Service()
+tickers = [f"{pair} BGN Curncy"]
+for t in tenors:
+    tickers.append(f"{pair}{'12M' if t == '1Y' else t} BGN Curncy")  # Forward
+    tickers.append(f"{pair}V{'1Y' if t == '1Y' else t} BGN Curncy")  # ATM
+    tickers.append(f"{pair}25R{'1Y' if t == '1Y' else t} BGN Curncy")  # 25D RR
+    tickers.append(f"{pair}25B{'1Y' if t == '1Y' else t} BGN Curncy")  # 25D BF
+    tickers.append(f"{pair}10R{'1Y' if t == '1Y' else t} BGN Curncy")  # 10D RR
+    tickers.append(f"{pair}10B{'1Y' if t == '1Y' else t} BGN Curncy")  # 10D BF
+
+px_item = bq_svc.data.px_last(dates=bq_svc.func.range(start_date, end_date))
+req = bql.Request(tickers, px_item)
+resp = bq_svc.execute(req)
+
+df_raw = resp[0].df().reset_index()
+px_cols = [c for c in df_raw.columns if "PX_LAST" in c.upper()]
+if not px_cols:
+    raise SystemExit("No PX_LAST column found.")
+df_raw.rename(columns={px_cols[0]: "Value"}, inplace=True)
+
+def detect_cat(tic: str):
+    up = tic.upper()
+    if "V" in up:
+        return "ATM_vol"
+    elif "25R" in up or "10R" in up:
+        return "RR"
+    elif "25B" in up or "10B" in up:
+        return "BF"
+    return "Other"
+
+def extract_tenor(tic: str):
+    m = re.search(r"(\d+[WMY])", tic.upper())
+    return m.group(1) if m else np.nan
+
+df_raw["Category"] = df_raw["ID"].apply(detect_cat)
+df_raw["Tenor"] = df_raw["ID"].apply(extract_tenor)
+df_raw["DATE"] = pd.to_datetime(df_raw["DATE"])
+
+df_raw = df_raw[df_raw["DATE"].dt.dayofweek < 5]
+df_raw = df_raw[df_raw["DATE"] >= pd.to_datetime(start_date)]
+df_raw = df_raw[df_raw["DATE"] <= pd.to_datetime(end_date)]
+df_raw.sort_values(["DATE", "Tenor"], inplace=True)
+
+# =============================================================================
+# 2) CALCULATION OF WINGS (10D/25D, call/put)
+# =============================================================================
+atm_df = df_raw[df_raw["Category"] == "ATM_vol"][["DATE", "Tenor", "Value"]].copy()
+atm_df.rename(columns={"Value": "ATM"}, inplace=True)
+
+rr25_df = df_raw[(df_raw["Category"] == "RR") & (df_raw["ID"].str.contains("25R"))].copy()
+rr25_df.rename(columns={"Value": "RR25"}, inplace=True)
+
+bf25_df = df_raw[(df_raw["Category"] == "BF") & (df_raw["ID"].str.contains("25B"))].copy()
+bf25_df.rename(columns={"Value": "BF25"}, inplace=True)
+
+rr10_df = df_raw[(df_raw["Category"] == "RR") & (df_raw["ID"].str.contains("10R"))].copy()
+rr10_df.rename(columns={"Value": "RR10"}, inplace=True)
+
+bf10_df = df_raw[(df_raw["Category"] == "BF") & (df_raw["ID"].str.contains("10B"))].copy()
+bf10_df.rename(columns={"Value": "BF10"}, inplace=True)
+
+def safe_merge(left, right, on=["DATE", "Tenor"]):
+    return left.merge(right, on=on, how="outer")
+
+df_merge = atm_df
+for sub_df in [rr25_df, bf25_df, rr10_df, bf10_df]:
+    df_merge = safe_merge(df_merge, sub_df)
+df_merge.sort_values(["DATE", "Tenor"], inplace=True)
+
+def call_put(atm, rr, bf):
+    if pd.isna(atm) or pd.isna(rr) or pd.isna(bf):
+        return np.nan, np.nan
+    c = atm + (0.5 * rr) + bf
+    p = atm - (0.5 * rr) + bf
+    return c, p
+
+df_merge["Call25"] = np.nan
+df_merge["Put25"] = np.nan
+df_merge["Call10"] = np.nan
+df_merge["Put10"] = np.nan
+
+for idx in df_merge.index:
+    atm_ = df_merge.at[idx, "ATM"]
+    rr25_ = df_merge.at[idx, "RR25"]
+    bf25_ = df_merge.at[idx, "BF25"]
+    rr10_ = df_merge.at[idx, "RR10"]
+    bf10_ = df_merge.at[idx, "BF10"]
+    c25, p25 = call_put(atm_, rr25_, bf25_)
+    c10, p10 = call_put(atm_, rr10_, bf10_)
+    df_merge.at[idx, "Call25"] = c25
+    df_merge.at[idx, "Put25"] = p25
+    df_merge.at[idx, "Call10"] = c10
+    df_merge.at[idx, "Put10"] = p10
+
+# =============================================================================
+# 3) LONG TABLE => PIVOT
+# =============================================================================
+# Replace internal name ("Call10") with label "10D Call"
+df_long = []
+for idx, row in df_merge.iterrows():
+    date_ = row["DATE"]
+    tn = row["Tenor"]
+    if pd.isna(tn):
+        continue
+    d_map = {
+        "Call10": row["Call10"],
+        "Call25": row["Call25"],
+        "ATM": row["ATM"],
+        "Put25": row["Put25"],
+        "Put10": row["Put10"]
+    }
+    for key in delta_order:
+        vol_ = d_map[key]
+        if pd.notna(vol_):
+            label = delta_map[key]
+            instr = f"{label}_{tn}"  # e.g. "10D Call_1M"
+            df_long.append((date_, instr, vol_))
+
+df_vol = pd.DataFrame(df_long, columns=["DATE", "Instrument", "Vol"])
+df_pivot = df_vol.pivot(index="DATE", columns="Instrument", values="Vol")
+df_pivot.sort_index(inplace=True)
+
+# =============================================================================
+# 4) SORT COLUMNS
+# =============================================================================
+label_order = ["10D Call", "25D Call", "ATM", "25D Put", "10D Put"]
+
+def parse_instrument_name(instr: str):
+    parts = instr.split("_")
+    if len(parts) != 2:
+        return (999, 999)
+    dLabel, tenorStr = parts
+    try:
+        d_val = label_order.index(dLabel)
+    except:
+        d_val = 999
+
+    def tenor_float(tn: str) -> float:
+        up = tn.upper()
+        if "W" in up:
+            return float(up[:-1]) / 52
+        elif "M" in up:
+            return float(up[:-1]) / 12
+        elif "Y" in up:
+            return float(up[:-1])
+        return 999
+
+    t_val = tenor_float(tenorStr)
+    return (d_val, t_val)
+
+col_sorted = sorted(df_pivot.columns, key=lambda c: parse_instrument_name(c))
+df_pivot = df_pivot[col_sorted]
+
+instruments = df_pivot.columns.tolist()
+n_inst = len(instruments)
+#print(f"[INFO] {n_inst} instruments => {instruments}")
+
+# =============================================================================
+# FUNCTIONS
+# =============================================================================
+def rolling_zscore(series, window=100):
+    rm = series.rolling(window=window, min_periods=window).mean()
+    rs = series.rolling(window=window, min_periods=window).std()
+    return (series - rm) / rs, rm, rs
+
+def compute_AR1_half_life(series: pd.Series) -> float:
+    s = series.dropna()
+    if len(s) < 5:
+        return np.nan
+    Y = s[1:].values
+    X = s[:-1].values
+    X = sm.add_constant(X)
+    if len(Y) != len(X):
+        return np.nan
+    model = sm.OLS(Y, X, missing='drop')
+    res = model.fit()
+    if len(res.params) < 2:
+        return np.nan
+    phi = res.params[1]
+    if abs(phi) >= 1:
+        return np.nan
+    hl = -np.log(2) / np.log(abs(phi))
+    return hl
+
+if df_pivot.empty:
+    print("No data => abort.")
+    import sys
+    sys.exit()
+
+last_date = df_pivot.index[-1]
+spread_mat = np.full((n_inst, n_inst), np.nan, dtype=float)
+pairs_info = []
+
+# =============================================================================
+# 5) CALCULATE SPREAD & Z-SCORE
+# =============================================================================
+for i in range(n_inst):
+    for j in range(n_inst):
+        if i == j:
+            continue
+        shortInst = instruments[i]
+        longInst = instruments[j]
+        spread_ser = df_pivot[longInst] - df_pivot[shortInst]
+
+        z_ser, rmean, rstd = rolling_zscore(spread_ser, rolling_window)
+        z_val = np.nan
+        last_spread = np.nan
+        last_mean = np.nan
+        if last_date in z_ser.index:
+            z_val = z_ser.loc[last_date]
+            last_spread = spread_ser.loc[last_date]
+            last_mean = rmean.loc[last_date] if last_date in rmean.index else np.nan
+
+        spread_mat[i, j] = z_val
+
+        # half-life on the complete series
+        hl = compute_AR1_half_life(spread_ser)
+        if pd.notna(z_val):
+            pairs_info.append(dict(
+                short=shortInst,
+                long=longInst,
+                Z=z_val,
+                Spread=last_spread,
+                Mean=last_mean,
+                HalfLife=hl
+            ))
+
+
+# =============================================================================
+# 6) TOP N SUGGESTIONS (Réordonné)
+# =============================================================================
+
+from rich.console import Console
+from rich.table import Table
+import numpy as np
+
+# Dictionnaire mapping label -> nom de colonne
+volatility_columns = {
+    "10D Call": "Call10",
+    "25D Call": "Call25",
+    "ATM":      "ATM",
+    "25D Put":  "Put25",
+    "10D Put":  "Put10"
+}
+
+# Tri des paires par le plus grand |Z-Score|
+pairs_info.sort(key=lambda d: abs(d["Z"]), reverse=True)
+
+unique_suggestions = set()
+suggestion_count = 0
+trade_suggestions = []
+
+def trade_suggestion(z, short_inst, long_inst):
+    """
+    Logique mean reversion sur le spread = (longInst - shortInst).
+    - z > 0 => Sell longInst, Buy shortInst (spread trop haut).
+    - z < 0 => Sell shortInst, Buy longInst (spread trop bas).
+    """
+    if z > 0:
+        return f"Sell {long_inst}", f"Buy {short_inst}"
+    else:
+        return f"Sell {short_inst}", f"Buy {long_inst}"
+
+for rowd in pairs_info:
+    z_   = rowd["Z"]
+    sp_  = rowd["Spread"]
+    mn_  = rowd["Mean"]
+    hl_  = rowd["HalfLife"]
+    sI   = rowd["short"]
+    lI   = rowd["long"]
+
+    # Détermine "Sell/Buy" en fonction du Z-Score
+    sell, buy = trade_suggestion(z_, sI, lI)
+
+    # Exemple de chaine : "Buy 10D Call_1M" => on découpe
+    sell_action, sell_instr = sell.split(" ", 1)
+    buy_action,  buy_instr  = buy.split(" ", 1)
+
+    sell_label, sell_tenor = sell_instr.split("_")
+    buy_label,  buy_tenor  = buy_instr.split("_")
+
+    # Filtrage sur la date la plus récente
+    df_filtered = df_merge[df_merge['DATE'] == last_date]
+
+    if df_filtered.empty:
+        volatility_buy  = np.nan
+        volatility_sell = np.nan
+    else:
+        df_buy_sub  = df_filtered[df_filtered['Tenor'] == buy_tenor]
+        df_sell_sub = df_filtered[df_filtered['Tenor'] == sell_tenor]
+
+        volatility_buy = (
+            df_buy_sub[volatility_columns[buy_label]].values[0]
+            if (not df_buy_sub.empty and buy_label in volatility_columns)
+            else np.nan
+        )
+        volatility_sell = (
+            df_sell_sub[volatility_columns[sell_label]].values[0]
+            if (not df_sell_sub.empty and sell_label in volatility_columns)
+            else np.nan
+        )
+
+    # Éviter de dupliquer la même paire
+    suggestion_id = tuple(sorted([sI, lI]))
+
+    if suggestion_id not in unique_suggestions:
+        unique_suggestions.add(suggestion_id)
+        trade_suggestions.append({
+            "Z-Score": z_,
+            "Buy": buy,
+            "Sell": sell,
+            "Spread": sp_,
+            "Mean": mn_,
+            "Half-Life": hl_,
+            "Volatility Buy":  volatility_buy,
+            "Volatility Sell": volatility_sell
+        })
+        suggestion_count += 1
+        if suggestion_count >= TOP_N:
+            break
+
+# -------------------------------------
+#       AFFICHAGE RÉORDONNÉ
+# -------------------------------------
+console = Console()
+print()
+
+table = Table(title=f" ****************** {pair} - Top Spreads Suggestions *******************")
+
+# Les colonnes dans l'ordre souhaité :
+table.add_column("Z-Score",           justify="center", style="bright_white",    no_wrap=True)
+table.add_column("Leg 2 (Buy)",       justify="center", style="bright_green",    max_width=20)
+table.add_column("Vol (Buy)",         justify="center", style="bright_white",    max_width=10)
+table.add_column("Leg 1 (Sell)",      justify="center", style="bright_red",      max_width=20)
+table.add_column("Vol (Sell)",        justify="center", style="bright_white",    max_width=10)
+table.add_column("Vol Sprd",          justify="center", style="#FFA500",         min_width=8)
+table.add_column("Avg Sprd in Vol",   justify="center", style="light_steel_blue", max_width=8)
+table.add_column("Half-Life (days)",  justify="center", style="#FFA500",         max_width=8)
+
+for suggestion in trade_suggestions:
+    table.add_row(
+        f"{suggestion['Z-Score']:.2f}",
+        suggestion['Buy'],  # Leg 2 (Buy)
+        f"{suggestion['Volatility Buy']:.2f}"  if not np.isnan(suggestion['Volatility Buy']) else "NaN",
+        suggestion['Sell'],  # Leg 1 (Sell)
+        f"{suggestion['Volatility Sell']:.2f}" if not np.isnan(suggestion['Volatility Sell']) else "NaN",
+        f"{suggestion['Spread']:.2f}",
+        f"{suggestion['Mean']:.2f}",
+        f"{suggestion['Half-Life']:.1f}" if not np.isnan(suggestion['Half-Life']) else "NaN",
+    )
+
+print()
+console.print(table)
+print()
+
+#===================================================================
+
+# 7) COMPLETE HEATMAP MATRIX (N×N)
+# =============================================================================
+df_z = pd.DataFrame(spread_mat, index=instruments, columns=instruments)
+
+fig = px.imshow(
+    df_z,
+    x=instruments,
+    y=instruments,
+    origin='lower',
+    color_continuous_scale=my_scale,
+    range_color=(-3, 3),
+    labels=dict(color="Z-Score"),
+    width=1500,
+    height=1500,
+    template="plotly_dark"
+)
+
+# Annotations
+annotations = []
+for i in range(n_inst):
+    for j in range(n_inst):
+        val = df_z.iloc[i, j]
+        if pd.notna(val):
+            txt = f"{val:.1f}"
+            color_ = "white" if val < 0 else "white"
+            annotations.append(dict(
+                x=instruments[j], y=instruments[i],
+                text=txt, showarrow=False,
+                font=dict(color=color_, size=11),
+                xref="x", yref="y", xanchor="center", yanchor="middle"
+            ))
+
+col_deltas = [instr.split("_", 1)[0] for instr in instruments]
+delta_boundaries = []
+for i in range(n_inst - 1):
+    if col_deltas[i] != col_deltas[i + 1]:
+        delta_boundaries.append(i + 0.5)
+
+shapes_list = []
+for bnd in delta_boundaries:
+    shapes_list.append(dict(
+        type="line",
+        x0=bnd, x1=bnd,
+        y0=0, y1=n_inst,
+        xref="x", yref="y",
+        line=dict(color="black", width=2)
+    ))
+    shapes_list.append(dict(
+        type="line",
+        y0=bnd, y1=bnd,
+        x0=0, x1=n_inst,
+        xref="x", yref="y",
+        line=dict(color="black", width=2)
+    ))
+
+fig.update_layout(shapes=shapes_list, annotations=annotations)
+fig.update_xaxes(side="top")
+fig.update_yaxes(autorange="reversed")
+
+fig.update_layout(
+    title=dict(text=f"{pair} - Full Z-Score Matrix (Delta→Tenors) rolling={rolling_window}", x=0.5),
+    **layout_conf
+)
+
+fig.show(config={'scrollZoom': True})
+print()
+
+print(f"\n[OK] Script terminé. Top {TOP_N} suggestions, deux matrices : full NxN et submatrix pour instruments du top {TOP_N}.\n")
+
+
+ #for the colours in 6) 
+#The rich library supports a wide range of colors, allowing you to customize the appearance of your tables extensively. Here is a list of standard and bright colors you can use in your table:
+
+#Standard Colors
+#black
+#red
+#green
+#yellow
+#blue
+#magenta
+#cyan
+#white
+#grey (or gray)
+#Bright Colors
+#bright_black
+#bright_red
+#bright_green
+#bright_yellow
+#bright_blue
+#bright_magenta
+#bright_cyan
+#bright_white
+#Additional Named Colors
+#The rich library also supports a wide array of named colors, which you can use for more specific styling. Here are a few examples:
+
+#dark_red
+#dark_green
+#dark_blue
+#dark_magenta
+#dark_cyan
+#light_goldenrod
+#light_salmon
+#light_sea_green
+#light_sky_blue
+#light_steel_blue
+#light_yellow
