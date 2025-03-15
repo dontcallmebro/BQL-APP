@@ -593,7 +593,7 @@ fig_zscores.show(config=plotly_config)
 
 #===================================================================
 
-# 7) COMPLETE HEATMAP MATRIX (N×N)
+# 8) COMPLETE HEATMAP MATRIX (N×N)
 # =============================================================================
 df_z = pd.DataFrame(spread_mat, index=instruments, columns=instruments)
 
