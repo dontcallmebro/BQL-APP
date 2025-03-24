@@ -1,0 +1,333 @@
+
+
+###################################################################
+# MORCEAU #2 : CrossCorr, Régression, Granger + Tableau Récap
+#              avec interprétation détaillée et taille adaptée
+#
+# Variables disponibles dans df_final (issu de Morceau #1):
+#   "DATE", "Tenor", 
+#   "Spot", "Forward", "ATM", "RR25", "BF25", "RR10", "BF10",
+#   "Call25", "Put25", "Call10", "Put10",
+#   "KCall25", "KPut25", "KCall10", "KPut10", "KATM",
+#   "SABR_Rho", "SABR_Nu",
+#   "DeltaSpot", "DeltaATM", "RollCorr", "CorrPct"
+#
+# Pour chaque tenor in user_tenors:
+#   1) CrossCorr (bar chart)
+#   2) Régression simple + graph (X obs vs X pred)
+#   3) Granger (moins verbeux)
+#   4) Tableau Récap final + Interprétation. 
+#      On l'affiche avec une largeur adaptée (pour meilleure lisibilité).
+###################################################################
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import statsmodels.formula.api as smf
+from statsmodels.tsa.stattools import grangercausalitytests
+from IPython.display import display, HTML
+
+##############################
+# Paramètres
+##############################
+varX = "RollCorr"       # Exemple : "CorrPct"
+varY = "RR25"      # Exemple : "SABR_Rho"
+
+crosscorr_lag   = 30
+max_lag_granger = 5
+
+##############################
+# Vérif df_final et user_tenors
+##############################
+try:
+    df_final
+except NameError:
+    print("[ERREUR] df_final introuvable. Exécutez d'abord Morceau #1.")
+    raise SystemExit
+
+try:
+    user_tenors
+except NameError:
+    print("[ERREUR] user_tenors introuvable. Exécutez d'abord Morceau #1.")
+    raise SystemExit
+
+for c in ["DATE","Tenor", varX, varY]:
+    if c not in df_final.columns:
+        print(f"[ERREUR] Colonne '{c}' absente => stop.")
+        raise SystemExit
+
+df_final.sort_values(["DATE","Tenor"], inplace=True)
+tenors_in_data = sorted(df_final["Tenor"].unique())
+
+print(f"\n=== MORCEAU #2 ===")
+print(f"   X={varX}, Y={varY}")
+print("   user_tenors:", user_tenors)
+print("   tenors in df_final:", tenors_in_data)
+
+##############################
+# Fonction CrossCorr
+##############################
+def cross_correlation(series1, series2, max_lag=20):
+    """DataFrame [lag, ccor], lag=-max_lag..+max_lag."""
+    s1 = series1.dropna()
+    s2 = series2.dropna()
+    idx = s1.index.intersection(s2.index)
+    s1 = s1.loc[idx]
+    s2 = s2.loc[idx]
+    out = []
+    for lag in range(-max_lag, max_lag+1):
+        if lag < 0:
+            shifted = s2.shift(-lag)
+        else:
+            shifted = s2.shift(lag)
+        c = s1.corr(shifted)
+        out.append([lag, c])
+    return pd.DataFrame(out, columns=["lag","ccor"])
+
+##############################
+# Analyse par tenor
+##############################
+for tenor_ in user_tenors:
+    print(f"\n========== TENOR = {tenor_} ==========")
+    if tenor_ not in tenors_in_data:
+        print(f"[INFO] Tenor '{tenor_}' absent => skip.")
+        continue
+
+    sub = df_final[df_final["Tenor"] == tenor_].copy()
+    sub.dropna(subset=[varX,varY], inplace=True)
+    if len(sub) < 5:
+        print(f"[INFO] Seulement {len(sub)} points => skip.")
+        continue
+
+    # On crée X, Y
+    sub["X"] = sub[varX]
+    sub["Y"] = sub[varY]
+
+    #####################################################
+    # (A) CROSS-CORRELATION
+    #####################################################
+    print(f"---- CROSS-CORR : X={varX} / Y={varY} ----")
+    cc_df = cross_correlation(sub["X"], sub["Y"], max_lag=crosscorr_lag)
+    print(cc_df.head(5).to_string(index=False))
+
+    idx_max  = cc_df["ccor"].abs().idxmax()
+    best_lag = cc_df.loc[idx_max,"lag"]
+    best_cc  = cc_df.loc[idx_max,"ccor"]
+    print(f"Meilleur lag={best_lag}, ccor={best_cc:.3f}")
+
+    # Graph
+    fig_cc = go.Figure()
+    fig_cc.add_trace(go.Bar(
+        x=cc_df["lag"], y=cc_df["ccor"],
+        marker_color="darkblue", name="CrossCorr"
+    ))
+    fig_cc.add_hline(y=0, line_color="red", line_width=2, line_dash="dash")
+    fig_cc.update_layout(
+        title=f"CrossCorr (X={varX}, Y={varY}) - Tenor={tenor_}",
+        xaxis_title="Lag",
+        yaxis_title="Correlation",
+        width=800, height=400,
+        template="plotly_dark"
+    )
+    fig_cc.show()
+
+    # Interprétation CrossCorr
+    interpret_cross = f"Max Corr={best_cc:.3f} à lag={best_lag}. "
+    if abs(best_cc) < 0.2:
+        interpret_cross += "Corr faible. "
+    elif abs(best_cc) < 0.5:
+        interpret_cross += "Corr modérée. "
+    else:
+        interpret_cross += "Corr forte. "
+
+    if best_lag > 0:
+        interpret_cross += f"(Y en avance d'env {best_lag} pas.)"
+    elif best_lag < 0:
+        interpret_cross += f"(X en avance d'env {-best_lag} pas.)"
+    else:
+        interpret_cross += "(pas de lead)."
+
+    # Analyse CrossCorr (spécifique à la valeur best_cc)
+    # Désormais on vérifie le signe:
+    sign_msg = ""
+    if best_cc > 0:
+        sign_msg = "Corr positive => X et Y évoluent dans le même sens. "
+    elif best_cc < 0:
+        sign_msg = "Corr négative => X et Y évoluent en sens inverse. "
+    else:
+        sign_msg = "Corr=0 => aucune corrélation. "
+
+    if abs(best_cc) >= 0.5:
+        analyze_cross = (f"Corr >=0.5 => Relation notable. {sign_msg}" 
+                         "Fort couplage entre X et Y.")
+    elif abs(best_cc) >= 0.2:
+        analyze_cross = (f"Corr modérée => X et Y partagent une tendance. {sign_msg}" 
+                         "Mais bruit possible.")
+    else:
+        analyze_cross = (f"Corr très faible => X et Y peu corrélés. {sign_msg}")
+
+    #####################################################
+    # (B) RÉGRESSION
+    #####################################################
+    print(f"---- RÉGRESSION : {varX}(t) ~ {varX}(t-1)+{varY}(t-1) ----")
+    sub_reg = sub.copy()
+    sub_reg["X_lag1"] = sub_reg["X"].shift(1)
+    sub_reg["Y_lag1"] = sub_reg["Y"].shift(1)
+    sub_reg.dropna(inplace=True)
+
+    r2_val = np.nan
+    pval_y = np.nan
+    coef_y = np.nan
+    interpret_reg = "Pas de régression (t<5 pts)."
+    analyze_reg    = "Aucune analyse."
+
+    if len(sub_reg) >= 5:
+        model  = smf.ols("X ~ X_lag1 + Y_lag1", data=sub_reg).fit()
+        r2_val = model.rsquared
+        pval_y = model.pvalues.get("Y_lag1", np.nan)
+        coef_y = model.params.get("Y_lag1", np.nan)
+
+        interpret_reg = (f"R²={r2_val:.3f}, p(Y_lag1)={pval_y:.3f}, "
+                         f"coef(Y_lag1)={coef_y:.3f}. ")
+        if pval_y < 0.05:
+            interpret_reg += "(Y(t-1) significatif)."
+        else:
+            interpret_reg += "(Y(t-1) non significatif)."
+
+        # Analyse basée sur la valeur
+        analyze_reg = ""
+        if r2_val >= 0.5:
+            analyze_reg += "Modèle explique >50% => bonne prédiction. "
+        else:
+            analyze_reg += "Modèle explique <50% => relation partielle. "
+
+        if pval_y < 0.05:
+            sign_ = "positive" if coef_y > 0 else "négative"
+            analyze_reg += f"Y(t-1) a une influence {sign_} sur X(t)."
+        else:
+            analyze_reg += "Y(t-1) n'apporte pas d'info significative."
+
+        # Graph
+        sub_reg["X_pred"] = model.fittedvalues
+        sub_reg["idx_t"]  = range(len(sub_reg))
+
+        fig_reg = go.Figure()
+        fig_reg.add_trace(go.Scatter(
+            x=sub_reg["idx_t"], y=sub_reg["X"],
+            mode="lines", line=dict(color="cyan", width=2),
+            name=f"{varX} obs"
+        ))
+        fig_reg.add_trace(go.Scatter(
+            x=sub_reg["idx_t"], y=sub_reg["X_pred"],
+            mode="lines", line=dict(color="magenta", width=2, dash="dot"),
+            name=f"{varX} pred"
+        ))
+        fig_reg.update_layout(
+            title=f"Régression: {varX} obs vs pred (Tenor={tenor_})",
+            xaxis_title="Index (valid pts)",
+            yaxis_title=varX,
+            width=800, height=400,
+            template="plotly_dark"
+        )
+        fig_reg.show()
+    else:
+        print(f"[INFO] {len(sub_reg)} pts => skip regression.")
+
+    #####################################################
+    # (C) GRANGER
+    #####################################################
+    print(f"---- GRANGER: {varY}->{varX} / {varX}->{varY}, maxlag={max_lag_granger} ----")
+    sub_gc = sub[["X","Y"]].dropna()
+    best_lag_yx = np.nan
+    min_pval_yx = np.nan
+    best_lag_xy = np.nan
+    min_pval_xy = np.nan
+    interpret_granger = "Pas de Granger (t<5 pts)."
+    analyze_granger   = "Aucune analyse."
+
+    if len(sub_gc) >= 5:
+        # Y->X
+        res_yx = grangercausalitytests(sub_gc[["X","Y"]], maxlag=max_lag_granger, verbose=False)
+        pvals_yx=[]
+        for lg,stuff in res_yx.items():
+            p_ = stuff[0]["ssr_ftest"][1]
+            pvals_yx.append((lg,p_))
+        best_lag_yx, min_pval_yx= min(pvals_yx, key=lambda x: x[1])
+
+        # X->Y
+        res_xy = grangercausalitytests(sub_gc[["Y","X"]], maxlag=max_lag_granger, verbose=False)
+        pvals_xy=[]
+        for lg,stuff in res_xy.items():
+            p_ = stuff[0]["ssr_ftest"][1]
+            pvals_xy.append((lg,p_))
+        best_lag_xy, min_pval_xy= min(pvals_xy, key=lambda x: x[1])
+
+        interpret_granger= (f"Y->X p={min_pval_yx:.3f} (lag={best_lag_yx}), "
+                            f"X->Y p={min_pval_xy:.3f} (lag={best_lag_xy}).")
+        # Analyse
+        analyze_granger= ""
+        if min_pval_yx<0.05:
+            analyze_granger+= "[Y cause X] "
+        if min_pval_xy<0.05:
+            analyze_granger+= "[X cause Y]"
+        if not analyze_granger:
+            analyze_granger= "Aucune causalité significative."
+
+    #####################################################
+    # (D) Tableau Récap (4 colonnes)
+    #####################################################
+    recap_data= [
+        ["CrossCorr best lag",  f"{best_lag}",
+         "Lag max correlation (+ => Y lead, - => X lead)",
+         analyze_cross],
+
+        ["CrossCorr best corr", f"{best_cc:.3f}",
+         "Amplitude => force, signe => direction",
+         "Valeur absolue >0.5 => lien fort; sinon plus faible"],
+
+        ["CrossCorr : interprétation", "",
+         interpret_cross,
+         "Synthèse CrossCorr max"],
+
+        ["Régression R²", f"{r2_val:.3f}" if not np.isnan(r2_val) else "NaN",
+         "Part variance X expliquée par (X(t-1),Y(t-1))",
+         ""],
+
+        ["Régression p(Y_lag1)", f"{pval_y:.3f}" if not np.isnan(pval_y) else "NaN",
+         "Significativité Y(t-1). <0.05 => influence.",
+         ""],
+
+        ["Régression coef(Y_lag1)", f"{coef_y:.3f}" if not np.isnan(coef_y) else "NaN",
+         "Signe => direction d'influence, magnitude => intensité.",
+         ""],
+
+        ["Régression : interprétation", "",
+         interpret_reg,
+         analyze_reg],
+
+        ["Granger Y->X p", f"{min_pval_yx:.3f}" if not np.isnan(min_pval_yx) else "NaN",
+         "p-value min sur lags(1..max). <0.05 => Y cause X",
+         ""],
+
+        ["Granger X->Y p", f"{min_pval_xy:.3f}" if not np.isnan(min_pval_xy) else "NaN",
+         "p-value min sur lags(1..max). <0.05 => X cause Y",
+         ""],
+
+        ["Granger : interprétation", "",
+         interpret_granger,
+         analyze_granger]
+    ]
+
+    df_recap = pd.DataFrame(
+        recap_data,
+        columns=["Metric","Value","Interpretation","Analyse"]
+    )
+
+    # Format HTML large
+    html_table= df_recap.to_html(index=False, escape=False)
+    table_html= f"<div style='width:1200px; background-color:#2B2B2B;'>{html_table}</div>"
+
+    print(f"\n--- Tableau Récap. Tenor =", tenor_, "---")
+    display(HTML(table_html))
+
+    print(f"=== FIN TENOR {tenor_} ===\n{'-'*50}")
