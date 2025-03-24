@@ -1,0 +1,73 @@
+---------------------------------------------------------------------------
+KeyError                                  Traceback (most recent call last)
+Cell In[4], line 138
+    131     return df_recap
+    133 # =========== LANCEMENT =============
+    134 # On imagine qu'on dispose déjà de df_final
+    135 # Ex: df_final = ...
+    136 
+    137 # On appelle la fonction :
+--> 138 df_recap_m2 = analyze_all_tenors(df_final, xcol="Diff", ycol="RR25")
+    140 # On affiche le tableau RÉCAPITULATIF (sans colonne "interpretation")
+    141 print("\n=== TABLEAU RÉCAPITULATIF FINAL (MORCEAU #2) ===")
+
+Cell In[4], line 94, in analyze_all_tenors(df, xcol, ycol, crosscorr_max_lag, granger_max_lag)
+     92 cdf["abscc"] = cdf["ccor"].abs()
+     93 idx_best = cdf["abscc"].idxmax()
+---> 94 best_lag = cdf.loc[idx_best,"lag"]
+     95 best_corr = cdf.loc[idx_best,"ccor"]
+     97 #--- REGRESSION EXEMPLES (y(t) ~ y(t-1) ou X(t) ~ X(t-1)) ---
+     98 # ICI on fait par ex. Y(t) ~ Y(t-1):
+
+File /opt/bqplatform/lib/python3.9/site-packages/pandas/core/indexing.py:925, in _LocationIndexer.__getitem__(self, key)
+    923         with suppress(KeyError, IndexError):
+    924             return self.obj._get_value(*key, takeable=self._takeable)
+--> 925     return self._getitem_tuple(key)
+    926 else:
+    927     # we by definition only have the 0th axis
+    928     axis = self.axis or 0
+
+File /opt/bqplatform/lib/python3.9/site-packages/pandas/core/indexing.py:1100, in _LocIndexer._getitem_tuple(self, tup)
+   1098 def _getitem_tuple(self, tup: tuple):
+   1099     with suppress(IndexingError):
+-> 1100         return self._getitem_lowerdim(tup)
+   1102     # no multi-index, so validate all of the indexers
+   1103     self._has_valid_tuple(tup)
+
+File /opt/bqplatform/lib/python3.9/site-packages/pandas/core/indexing.py:838, in _LocationIndexer._getitem_lowerdim(self, tup)
+    834 for i, key in enumerate(tup):
+    835     if is_label_like(key):
+    836         # We don't need to check for tuples here because those are
+    837         #  caught by the _is_nested_tuple_indexer check above.
+--> 838         section = self._getitem_axis(key, axis=i)
+    840         # We should never have a scalar section here, because
+    841         #  _getitem_lowerdim is only called after a check for
+    842         #  is_scalar_access, which that would be.
+    843         if section.ndim == self.ndim:
+    844             # we're in the middle of slicing through a MultiIndex
+    845             # revise the key wrt to `section` by inserting an _NS
+
+File /opt/bqplatform/lib/python3.9/site-packages/pandas/core/indexing.py:1164, in _LocIndexer._getitem_axis(self, key, axis)
+   1162 # fall thru to straight lookup
+   1163 self._validate_key(key, axis)
+-> 1164 return self._get_label(key, axis=axis)
+
+File /opt/bqplatform/lib/python3.9/site-packages/pandas/core/indexing.py:1113, in _LocIndexer._get_label(self, label, axis)
+   1111 def _get_label(self, label, axis: int):
+   1112     # GH#5667 this will fail if the label is not present in the axis.
+-> 1113     return self.obj.xs(label, axis=axis)
+
+File /opt/bqplatform/lib/python3.9/site-packages/pandas/core/generic.py:3776, in NDFrame.xs(self, key, axis, level, drop_level)
+   3774         raise TypeError(f"Expected label or tuple of labels, got {key}") from e
+   3775 else:
+-> 3776     loc = index.get_loc(key)
+   3778     if isinstance(loc, np.ndarray):
+   3779         if loc.dtype == np.bool_:
+
+File /opt/bqplatform/lib/python3.9/site-packages/pandas/core/indexes/range.py:388, in RangeIndex.get_loc(self, key, method, tolerance)
+    386         except ValueError as err:
+    387             raise KeyError(key) from err
+--> 388     raise KeyError(key)
+    389 return super().get_loc(key, method=method, tolerance=tolerance)
+
+KeyError: nan
